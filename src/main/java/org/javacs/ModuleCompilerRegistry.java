@@ -15,8 +15,8 @@ final class ModuleCompilerRegistry implements AutoCloseable {
     /** Maven spawns one process per module; keep the fan-out bounded on shared machines. */
     private static final int MAX_RESOLVER_THREADS = 4;
     /**
-     * Opt-in (JLS_WORKSPACE_BINARIES=1): put the compiled output (target/classes) of the module's
-     * workspace dependencies on the classpath, next to their sources. With -Xprefer:newer javac
+     * Opt-in (JLS_WORKSPACE_BINARIES=1): put the compiled output (target/classes) of the module and
+     * of its workspace dependencies on the classpath, next to their sources. With -Xprefer:newer javac
      * reads an unchanged class from its .class file and an edited one from source, so the first
      * analysis of a module no longer re-parses every dependency source file.
      */
@@ -131,13 +131,19 @@ final class ModuleCompilerRegistry implements AutoCloseable {
         }
     }
 
-    /** target/classes of the workspace modules this module depends on (never its own output). */
+    /**
+     * target/classes of the module itself and of the workspace modules it depends on. The file
+     * being analyzed is always compiled from source; its siblings come from their .class files
+     * unless edited or saved after the last build (-Xprefer:newer).
+     */
     private List<Path> workspaceBinaries(ModuleGraph.ModuleInfo module, boolean test) {
         if (!WORKSPACE_BINARIES) return List.of();
+        var modules = new LinkedHashSet<String>();
+        modules.add(module.projectPath());
+        modules.addAll(server.moduleGraph.transitiveModuleDependencies(module.projectPath(), test));
         var result = new ArrayList<Path>();
-        for (var dependency : server.moduleGraph.transitiveModuleDependencies(module.projectPath(), test)) {
-            if (dependency.equals(module.projectPath())) continue;
-            var info = server.moduleGraph.modules().get(dependency);
+        for (var name : modules) {
+            var info = server.moduleGraph.modules().get(name);
             var output = info == null ? null : info.mainOutputDir();
             if (output != null && java.nio.file.Files.isDirectory(output)) {
                 result.add(output);
