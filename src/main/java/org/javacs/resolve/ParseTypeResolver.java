@@ -74,7 +74,8 @@ public final class ParseTypeResolver {
         }
 
         public String firstTypeArgument() {
-            return typeArguments.isEmpty() ? null : typeArguments.get(0);
+            return typeArguments.isEmpty() || typeArguments.get(0) == null || typeArguments.get(0).isBlank()
+                    ? null : typeArguments.get(0);
         }
 
         public TypeResolution withFirstTypeArgument(String arg) {
@@ -295,6 +296,11 @@ public final class ParseTypeResolver {
             if (classLiteralBound.isPresent()) {
                 return classLiteralBound;
             }
+            var argumentBound = resolveGenericMethodReturn(
+                    receiver.get(), memberSelectTree.getIdentifier().toString(), invocationTree, depth + 1);
+            if (argumentBound.isPresent()) {
+                return argumentBound;
+            }
             return resolveMethodReturnType(
                     receiver.get(),
                     memberSelectTree.getIdentifier().toString(),
@@ -370,6 +376,78 @@ public final class ParseTypeResolver {
             return returnTypeOf(member.get());
         }
         return resolveExternalMethodReturnType(receiverType, member.get()).or(() -> returnTypeOf(member.get()));
+    }
+
+    /**
+     * Return type of a library method whose own type variables are bound by its arguments.
+     *
+     * <p>Example: {@code List.of(customer)} is {@code <E> List<E> of(E e1)}, so it returns
+     * {@code List<Customer>}; {@code Arrays.asList(array)} binds {@code T} to the component type.
+     */
+    private Optional<TypeResolution> resolveGenericMethodReturn(
+            TypeResolution receiver, String methodName, MethodInvocationTree invocation, int depth) {
+        if (receiver == null || !canUseExternalInference(receiver.qualifiedType()) || depth > MAX_RESOLVE_DEPTH) {
+            return Optional.empty();
+        }
+        var args = invocation.getArguments();
+        var method = reflectiveMethodForArguments(receiver.qualifiedType(), methodName, receiver.staticContext(), args.size());
+        if (method.isEmpty() || method.get().getTypeParameters().length == 0) {
+            return Optional.empty();
+        }
+        var methodVars = java.util.Set.of(method.get().getTypeParameters());
+        var bindings = new HashMap<>(bindingsForMethodOwner(receiver, method.get().getDeclaringClass()));
+        var params = method.get().getGenericParameterTypes();
+        var bound = false;
+        for (int i = 0; i < args.size() && params.length > 0; i++) {
+            var last = params.length - 1;
+            var param = params[Math.min(i, last)];
+            var argument = resolveExpressionAtDepth(args.get(i), depth + 1);
+            if (argument.isEmpty() || argument.get().staticContext()) {
+                continue;
+            }
+            var type = argument.get();
+            if (method.get().isVarArgs() && i >= last && param instanceof GenericArrayType array) {
+                // T... called with elements binds T to an element; called with an array, to its component
+                param = array.getGenericComponentType();
+                if (type.arrayType()) type = new TypeResolution(type.qualifiedType(), false, false);
+            }
+            if (param instanceof java.lang.reflect.TypeVariable<?> variable
+                    && methodVars.contains(variable)
+                    && !bindings.containsKey(variable)
+                    && !type.arrayType()) {
+                bindings.put(variable, type);
+                bound = true;
+            }
+        }
+        if (!bound) {
+            return Optional.empty();
+        }
+        return resolveReflectiveType(method.get().getGenericReturnType(), bindings);
+    }
+
+    /** Overload for a call with {@code argumentCount} arguments: exact arity first, then varargs. */
+    private Optional<Method> reflectiveMethodForArguments(
+            String ownerType, String methodName, boolean staticContext, int argumentCount) {
+        var rawClass = loadExternalClass(ownerType);
+        if (rawClass.isEmpty()) {
+            return Optional.empty();
+        }
+        Method exact = null;
+        Method varargs = null;
+        for (var method : rawClass.get().getMethods()) {
+            if (!method.getName().equals(methodName)
+                    || staticContext != java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+                continue;
+            }
+            if (method.getParameterCount() == argumentCount && !method.isVarArgs()) {
+                if (exact != null && !sameReflectiveSignature(exact, method)) return Optional.empty();
+                exact = method;
+            } else if (method.isVarArgs() && argumentCount >= method.getParameterCount() - 1) {
+                if (varargs != null && !sameReflectiveSignature(varargs, method)) varargs = null;
+                else varargs = method;
+            }
+        }
+        return Optional.ofNullable(exact != null ? exact : varargs);
     }
 
     private Optional<IndexedMember> resolveIndexedMember(
@@ -587,9 +665,14 @@ public final class ParseTypeResolver {
         if (parent == null || !(parent.getLeaf() instanceof LambdaExpressionTree lambda)) {
             return Optional.empty();
         }
-        if (lambda.getParameters().size() != 1 || lambda.getParameters().get(0) != variableTree) {
+        var parameterIndex = -1;
+        for (int i = 0; i < lambda.getParameters().size(); i++) {
+            if (lambda.getParameters().get(i) == variableTree) parameterIndex = i;
+        }
+        if (parameterIndex < 0) {
             return Optional.empty();
         }
+        var arity = lambda.getParameters().size();
         var invocationPath = parent.getParentPath();
         if (invocationPath == null || !(invocationPath.getLeaf() instanceof MethodInvocationTree invocation)) {
             return Optional.empty();
@@ -604,14 +687,17 @@ public final class ParseTypeResolver {
         if (argumentIndex < 0) {
             return Optional.empty();
         }
-        var streamParameterType =
-                functionalTargetResolver.resolveLambdaParameterType(
-                        lambda, parent, invocation, argumentIndex, depth + 1);
-        if (streamParameterType.isPresent()) {
-            return streamParameterType;
+        if (arity == 1) {
+            var streamParameterType =
+                    functionalTargetResolver.resolveLambdaParameterType(
+                            lambda, parent, invocation, argumentIndex, depth + 1);
+            if (streamParameterType.isPresent()) {
+                return streamParameterType;
+            }
         }
         var functionalType = resolveInvocationArgumentType(invocation, argumentIndex, depth + 1);
-        return functionalType.flatMap(this::resolveSamParameterType);
+        var index = parameterIndex;
+        return functionalType.flatMap(type -> resolveSamParameterType(type, index, arity));
     }
 
     /** Resolve a source type tree into a qualified type before any declaration lookup begins. */
@@ -627,8 +713,13 @@ public final class ParseTypeResolver {
             if (raw.isEmpty()) {
                 return Optional.empty();
             }
-            var firstTypeArgument = firstTypeArgument(parameterizedTypeTree, sourceRoot);
-            return Optional.of(raw.get().withFirstTypeArgument(firstTypeArgument.orElse(null)));
+            // Every type argument, by position ("" when unresolved): Map<K, V>.get/values need V.
+            var arguments = new ArrayList<String>();
+            for (var argument : parameterizedTypeTree.getTypeArguments()) {
+                arguments.add(typeArgumentName(argument, sourceRoot).orElse(""));
+            }
+            return Optional.of(raw.get().withTypeArguments(
+                    arguments.stream().allMatch(String::isBlank) ? List.of() : arguments));
         }
         if (tree instanceof ArrayTypeTree arrayTypeTree) {
             var component = resolveTypeTree(arrayTypeTree.getType(), sourceRoot, staticContext);
@@ -654,6 +745,16 @@ public final class ParseTypeResolver {
             resolved = resolveTypeNameInSource(typeName, sourceRoot);
         }
         return resolved.map(type -> new TypeResolution(type, staticContext, false));
+    }
+
+    /** A type argument's name; a bounded wildcard ({@code ? extends Foo}) stands for its bound. */
+    private Optional<String> typeArgumentName(Tree argument, CompilationUnitTree sourceRoot) {
+        if (argument instanceof com.sun.source.tree.WildcardTree wildcard) {
+            return wildcard.getBound() == null
+                    ? Optional.empty()
+                    : resolveTypeTree(wildcard.getBound(), sourceRoot, false).map(ParseTypeResolver::typeName);
+        }
+        return resolveTypeTree(argument, sourceRoot, false).map(ParseTypeResolver::typeName);
     }
 
     private Optional<String> firstTypeArgument(ParameterizedTypeTree parameterizedTypeTree, CompilationUnitTree sourceRoot) {
@@ -764,31 +865,17 @@ public final class ParseTypeResolver {
         if (array && qualified.endsWith("[]")) {
             qualified = qualified.substring(0, qualified.length() - 2);
         }
-        // Resolve the first type argument in the owner's scope so generic return types
-        // (e.g. Optional<ModuleInfo>) propagate type arguments correctly.
-        String firstTypeArg = null;
-        var argStart = typeName.indexOf('<');
-        var argEnd = typeName.lastIndexOf('>');
-        if (argStart >= 0 && argEnd > argStart) {
-            var argText = typeName.substring(argStart + 1, argEnd).trim();
-            var comma = argText.indexOf(',');
-            if (comma >= 0) argText = argText.substring(0, comma).trim();
-            while (argText.startsWith("? extends ")) argText = argText.substring("? extends ".length()).trim();
-            while (argText.startsWith("? super ")) argText = argText.substring("? super ".length()).trim();
-            if (!argText.isBlank() && !"?".equals(argText)) {
-                var argNormalized = TypeNames.normalize(argText);
-                if (!argNormalized.isEmpty()) {
-                    var argResolved = index.resolveType(argNormalized, ownerRoot)
-                            .map(indexed -> indexed.qualifiedName);
-                    if (argResolved.isPresent()) {
-                        firstTypeArg = argResolved.get();
-                    }
-                }
-            }
-        }
+        // Resolve the type arguments in the owner's scope so generic return types
+        // (e.g. Optional<ModuleInfo>, Map<String, Foo>) propagate them correctly.
+        var arguments = typeArgumentsFromTypeName(typeName, arg -> {
+            var argNormalized = TypeNames.normalize(arg);
+            return argNormalized.isEmpty()
+                    ? Optional.empty()
+                    : index.resolveType(argNormalized, ownerRoot).map(indexed -> indexed.qualifiedName);
+        });
         return Optional.of(
                 new TypeResolution(qualified, false, array)
-                        .withFirstTypeArgument(firstTypeArg));
+                        .withTypeArguments(arguments));
     }
 
     private Optional<TypeResolution> resolveDirectMemberType(TypeResolution receiverType, String memberName) {
@@ -906,14 +993,16 @@ public final class ParseTypeResolver {
             boolean staticContext,
             MethodInvocationTree invocation,
             int argumentIndex) {
-        var indexed = resolveIndexedMethodArgumentType(ownerType, methodName, staticContext, invocation, argumentIndex);
-        if (indexed.isPresent()) {
-            return indexed;
+        // Library methods: reflection binds the receiver's type arguments (forEach(Consumer<? super T>)
+        // on a List<Customer> -> Consumer<Customer>); the index keeps the declared, unbound T.
+        if (canUseExternalInference(ownerType)) {
+            var external = resolveExternalMethodArgumentType(
+                    receiverType, ownerType, methodName, staticContext, invocation, argumentIndex);
+            if (external.isPresent()) {
+                return external;
+            }
         }
-        if (!canUseExternalInference(ownerType)) {
-            return Optional.empty();
-        }
-        return resolveExternalMethodArgumentType(receiverType, ownerType, methodName, staticContext, invocation, argumentIndex);
+        return resolveIndexedMethodArgumentType(ownerType, methodName, staticContext, invocation, argumentIndex);
     }
 
     private Optional<TypeResolution> resolveIndexedMethodArgumentType(
@@ -975,13 +1064,18 @@ public final class ParseTypeResolver {
     }
 
     private Optional<TypeResolution> resolveSamParameterType(TypeResolution functionalType) {
+        return resolveSamParameterType(functionalType, 0, 1);
+    }
+
+    /** Type of parameter {@code index} of the functional interface's method, which takes {@code arity}. */
+    private Optional<TypeResolution> resolveSamParameterType(TypeResolution functionalType, int index, int arity) {
         if (functionalType == null || functionalType.qualifiedType() == null || functionalType.qualifiedType().isBlank()) {
             return Optional.empty();
         }
         if (isWorkspaceType(functionalType.qualifiedType())) {
-            return resolveIndexedSamParameterType(functionalType);
+            return resolveIndexedSamParameterType(functionalType, index, arity);
         }
-        return resolveExternalSamParameterType(functionalType);
+        return resolveExternalSamParameterType(functionalType, index, arity);
     }
 
     private Optional<Integer> resolveSamArity(TypeResolution functionalType) {
@@ -1000,13 +1094,13 @@ public final class ParseTypeResolver {
         return singleAbstractMethod(rawClass.get()).map(Method::getParameterCount);
     }
 
-    private Optional<TypeResolution> resolveIndexedSamParameterType(TypeResolution functionalType) {
+    private Optional<TypeResolution> resolveIndexedSamParameterType(TypeResolution functionalType, int index, int arity) {
         var sam = indexedSam(functionalType.qualifiedType());
         if (sam.isEmpty()) return Optional.empty();
-        if (sam.get().declaredParameterTypes == null || sam.get().declaredParameterTypes.length != 1) {
+        if (sam.get().declaredParameterTypes == null || sam.get().declaredParameterTypes.length != arity) {
             return Optional.empty();
         }
-        return resolveDeclaredTypeName(sam.get().declaredParameterTypes[0]);
+        return resolveDeclaredTypeName(sam.get().declaredParameterTypes[index]);
     }
 
     private Optional<IndexedMember> indexedSam(String qualifiedType) {
@@ -1058,13 +1152,13 @@ public final class ParseTypeResolver {
         return resolveReflectiveType(method.get().getGenericReturnType(), bindings);
     }
 
-    private Optional<TypeResolution> resolveExternalSamParameterType(TypeResolution functionalType) {
+    private Optional<TypeResolution> resolveExternalSamParameterType(TypeResolution functionalType, int index, int arity) {
         var rawClass = loadExternalClass(functionalType.qualifiedType());
         if (rawClass.isEmpty()) {
             return Optional.empty();
         }
         var sam = singleAbstractMethod(rawClass.get());
-        if (sam.isEmpty() || sam.get().getParameterCount() != 1) {
+        if (sam.isEmpty() || sam.get().getParameterCount() != arity) {
             return Optional.empty();
         }
         var bindings = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
@@ -1076,7 +1170,9 @@ public final class ParseTypeResolver {
                 bindings.put(vars[i], simpleResolution(arg));
             }
         }
-        return resolveReflectiveType(sam.get().getGenericParameterTypes()[0], bindings);
+        // The SAM may be declared by a superinterface (BinaryOperator<T> -> BiFunction<T, U, R>.apply).
+        var samBindings = resolveBindingsForClass(rawClass.get(), bindings, sam.get().getDeclaringClass()).orElse(bindings);
+        return resolveReflectiveType(sam.get().getGenericParameterTypes()[index], samBindings);
     }
 
     private Optional<Method> resolveReflectiveMethod(
@@ -1176,9 +1272,9 @@ public final class ParseTypeResolver {
             Type type, Map<java.lang.reflect.TypeVariable<?>, TypeResolution> bindings) {
         if (type instanceof Class<?> rawClass) {
             if (rawClass.isArray()) {
-                return Optional.of(new TypeResolution(rawClass.getComponentType().getName(), false, true));
+                return Optional.of(new TypeResolution(sourceName(rawClass.getComponentType()), false, true));
             }
-            return Optional.of(new TypeResolution(rawClass.getName(), false, false));
+            return Optional.of(new TypeResolution(sourceName(rawClass), false, false));
         }
         if (type instanceof ParameterizedType parameterized) {
             var raw = resolveReflectiveType(parameterized.getRawType(), bindings);
@@ -1217,6 +1313,12 @@ public final class ParseTypeResolver {
             return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType(), false, true));
         }
         return Optional.empty();
+    }
+
+    /** Source-style name: nested classes as {@code java.util.Map.Entry}, as the index keys them. */
+    private static String sourceName(Class<?> type) {
+        var canonical = type.getCanonicalName();
+        return canonical != null ? canonical : type.getName();
     }
 
     private Optional<Class<?>> rawClass(Type type) {
@@ -1286,30 +1388,37 @@ public final class ParseTypeResolver {
         return Optional.ofNullable(found);
     }
 
-    private Optional<String> firstTypeArgumentFromTypeName(String typeName) {
-        if (typeName == null || typeName.isBlank()) {
-            return Optional.empty();
-        }
+    /**
+     * Every type argument of a type written as text ({@code Map<String, Foo>} -> [String, Foo]), by
+     * position; "" where unresolved. Wildcards stand for their bound.
+     */
+    private static List<String> typeArgumentsFromTypeName(
+            String typeName, java.util.function.Function<String, Optional<String>> resolve) {
+        if (typeName == null) return List.of();
         var start = typeName.indexOf('<');
         var end = typeName.lastIndexOf('>');
-        if (start < 0 || end <= start) {
-            return Optional.empty();
+        if (start < 0 || end <= start) return List.of();
+        var parts = new ArrayList<String>();
+        var depth = 0;
+        var from = start + 1;
+        for (int i = start + 1; i < end; i++) {
+            var c = typeName.charAt(i);
+            if (c == '<') depth++;
+            else if (c == '>') depth--;
+            else if (c == ',' && depth == 0) {
+                parts.add(typeName.substring(from, i));
+                from = i + 1;
+            }
         }
-        var first = typeName.substring(start + 1, end).trim();
-        var comma = first.indexOf(',');
-        if (comma >= 0) {
-            first = first.substring(0, comma).trim();
+        parts.add(typeName.substring(from, end));
+        var result = new ArrayList<String>();
+        for (var part : parts) {
+            var arg = part.trim();
+            while (arg.startsWith("? extends ")) arg = arg.substring("? extends ".length()).trim();
+            while (arg.startsWith("? super ")) arg = arg.substring("? super ".length()).trim();
+            result.add(arg.isBlank() || "?".equals(arg) ? "" : resolve.apply(arg).orElse(""));
         }
-        while (first.startsWith("? extends ")) {
-            first = first.substring("? extends ".length()).trim();
-        }
-        while (first.startsWith("? super ")) {
-            first = first.substring("? super ".length()).trim();
-        }
-        if (first.isBlank() || "?".equals(first)) {
-            return Optional.empty();
-        }
-        return resolveDeclaredTypeName(first).map(TypeResolution::qualifiedType);
+        return result.stream().allMatch(String::isBlank) ? List.of() : result;
     }
 
     private Optional<TypeResolution> resolveDeclaredTypeName(String typeName) {
@@ -1333,7 +1442,8 @@ public final class ParseTypeResolver {
         }
         return Optional.of(
                 new TypeResolution(qualified, false, array)
-                        .withFirstTypeArgument(firstTypeArgumentFromTypeName(typeName).orElse(null)));
+                        .withTypeArguments(typeArgumentsFromTypeName(
+                                typeName, arg -> resolveDeclaredTypeName(arg).map(TypeResolution::qualifiedType))));
     }
 
     private boolean isWorkspaceType(String qualifiedType) {

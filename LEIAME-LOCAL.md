@@ -15,6 +15,12 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   restaura o índice dele e aplica só os arquivos editados desde então (`FileStore.changedSince`).
   `app` → `core` → `app`: autocomplete pronto em 2,9 s e 0,4 s (antes: duas reconstruções de 8–15 s).
   Recorte do índice do `app` × índice do `core` construído do zero: despejos idênticos.
+- **Autocomplete em lambdas/streams** (`ParseTypeResolver`): `forEach` (lista e stream), `removeIf`,
+  `Optional.map/ifPresent`, `reduce`, lambdas com 2+ parâmetros (`(k, v) ->`), `List.of(x)`/
+  `Arrays.asList(x)`/`Optional.ofNullable(x)` (genérico do método ligado ao argumento) e o 2º genérico
+  de `Map<K, V>` (`get`, `values`, `forEach`). Antes caíam em `Object`.
+  Limite conhecido: membros de classes aninhadas de biblioteca (`Map.Entry`) não aparecem — o índice
+  externo só conhece classes de primeiro nível.
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.
