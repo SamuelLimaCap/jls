@@ -101,7 +101,9 @@ public final class CompileBatch implements AutoCloseable {
             }
         }
 
-        Collections.addAll(list, "-proc:none", "-implicit:none", "-Xprefer:source");
+        // Workspace binaries need -Xprefer:newer so an edited dependency source beats its stale .class.
+        Collections.addAll(list, "-proc:none", "-implicit:none",
+                ModuleCompilerRegistry.WORKSPACE_BINARIES ? "-Xprefer:newer" : "-Xprefer:source");
         return list;
     }
 

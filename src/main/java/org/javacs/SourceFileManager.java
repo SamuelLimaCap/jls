@@ -32,7 +32,10 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
     public Iterable<JavaFileObject> list(
             Location location, String packageName, Set<JavaFileObject.Kind> kinds, boolean recurse) throws IOException {
         var listed = super.list(location, packageName, kinds, recurse);
-        if (location == StandardLocation.CLASS_PATH && kinds.contains(JavaFileObject.Kind.CLASS)) {
+        // With workspace binaries the dependency output dirs are on the classpath on purpose:
+        // javac (-Xprefer:newer) picks the .class or the source, whichever is newer.
+        if (location == StandardLocation.CLASS_PATH && kinds.contains(JavaFileObject.Kind.CLASS)
+                && !ModuleCompilerRegistry.WORKSPACE_BINARIES) {
             var external = new ArrayList<JavaFileObject>();
             for (var file : listed) {
                 if (file.getKind() != JavaFileObject.Kind.CLASS
@@ -89,7 +92,7 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
     public JavaFileObject getJavaFileForInput(Location location, String className, JavaFileObject.Kind kind)
             throws IOException {
         if (location == StandardLocation.CLASS_PATH && kind == JavaFileObject.Kind.CLASS
-                && workspaceType.test(className)) return null;
+                && !ModuleCompilerRegistry.WORKSPACE_BINARIES && workspaceType.test(className)) return null;
         if (location == StandardLocation.SOURCE_PATH && "module-info".equals(className)) return null;
         var source = super.getJavaFileForInput(location, className, kind);
         if (location != StandardLocation.SOURCE_PATH || kind != JavaFileObject.Kind.SOURCE) return source;

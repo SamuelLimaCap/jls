@@ -14,6 +14,31 @@ final class ModuleCompilerRegistry implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
     /** Maven spawns one process per module; keep the fan-out bounded on shared machines. */
     private static final int MAX_RESOLVER_THREADS = 4;
+    /**
+     * Opt-in (JLS_WORKSPACE_BINARIES=1): put the compiled output (target/classes) of the module's
+     * workspace dependencies on the classpath, next to their sources. With -Xprefer:newer javac
+     * reads an unchanged class from its .class file and an edited one from source, so the first
+     * analysis of a module no longer re-parses every dependency source file.
+     */
+    static final boolean WORKSPACE_BINARIES = "1".equals(System.getenv("JLS_WORKSPACE_BINARIES"));
+    /**
+     * Source roots of the modules whose output dir went on some classpath. A context may hold a
+     * symbol of such a module read from its .class file, which is never in the context's parsed
+     * set, so an edit there must retire the context (see ReusableCompiler.stillValid).
+     */
+    private static final Set<Path> BINARY_BACKED_SOURCE_ROOTS = ConcurrentHashMap.newKeySet();
+
+    static boolean isBinaryBacked(Path source) {
+        if (!WORKSPACE_BINARIES || source == null) return false;
+        for (var root : BINARY_BACKED_SOURCE_ROOTS) if (source.startsWith(root)) return true;
+        return false;
+    }
+
+    private static void addBinaryBackedRoot(Path root) {
+        var normalized = root.toAbsolutePath().normalize();
+        BINARY_BACKED_SOURCE_ROOTS.add(normalized);
+        try { BINARY_BACKED_SOURCE_ROOTS.add(normalized.toRealPath()); } catch (java.io.IOException missing) { }
+    }
     private final JavaLanguageServer server;
     final Map<String, ModuleCompiler> moduleCompilers = new ConcurrentHashMap<>();
     private final Map<String, GradleTooling.ResolvedModule> gradleDependencies = new HashMap<>();
@@ -84,7 +109,10 @@ final class ModuleCompilerRegistry implements AutoCloseable {
         try {
             var inputs = resolveInputs(module, module.isTestSource(file));
             includeSources(inputs.sourceRoots());
-            var next = new JavaCompilerService(server.moduleGraph.externalClasspath(inputs.classpath()),
+            var classpath = new LinkedHashSet<>(server.moduleGraph.externalClasspath(inputs.classpath()));
+            var binaries = workspaceBinaries(module, module.isTestSource(file));
+            classpath.addAll(binaries);
+            var next = new JavaCompilerService(classpath,
                     inputs.sources(), configuredAddExports, compilerArguments(module));
             next.setSourceRoots(inputs.sourceRoots());
             moduleCompilers.put(key, new ModuleCompiler(next, inputs.sourceRoots()));
@@ -95,12 +123,28 @@ final class ModuleCompilerRegistry implements AutoCloseable {
                 mainCompiler.addDocPathEntries(inputs.sources());
             }
             LOG.info("[module] ready id=" + key + " sources=" + inputs.sourceRoots().size()
-                    + " dependencies=" + next.classPath.size() + " workspace_binaries=0 ms="
+                    + " dependencies=" + next.classPath.size() + " workspace_binaries=" + binaries.size() + " ms="
                     + (System.nanoTime() - started) / 1_000_000);
             return next;
         } finally {
             if (token != null) server.progress.end(token, "Module resolved");
         }
+    }
+
+    /** target/classes of the workspace modules this module depends on (never its own output). */
+    private List<Path> workspaceBinaries(ModuleGraph.ModuleInfo module, boolean test) {
+        if (!WORKSPACE_BINARIES) return List.of();
+        var result = new ArrayList<Path>();
+        for (var dependency : server.moduleGraph.transitiveModuleDependencies(module.projectPath(), test)) {
+            if (dependency.equals(module.projectPath())) continue;
+            var info = server.moduleGraph.modules().get(dependency);
+            var output = info == null ? null : info.mainOutputDir();
+            if (output != null && java.nio.file.Files.isDirectory(output)) {
+                result.add(output);
+                info.sourceDirs().forEach(ModuleCompilerRegistry::addBinaryBackedRoot);
+            }
+        }
+        return result;
     }
 
     boolean multiModule() {

@@ -227,6 +227,13 @@ final class ReusableCompiler {
                             + file.getFileName());
                     return false;
                 }
+                // Workspace binaries: the retained symbol may come from the module's .class file,
+                // so it is not in parsed. Retire and let -Xprefer:newer pick the edited source.
+                if (!reparsed.contains(source) && ModuleCompilerRegistry.isBinaryBacked(source)) {
+                    LOG.info("[analysis] retire context=" + id + " reason=binary_backed_source_changed file="
+                            + file.getFileName());
+                    return false;
+                }
             }
             return true;
         }
