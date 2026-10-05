@@ -44,6 +44,18 @@ final class CompletionIndexScheduler {
      * publish an index resolved against a closed one.
      */
     private long epoch;
+    /** Source roots the current scope can see; null when the file belongs to no module. */
+    private Set<Path> scopeRoots = Set.of();
+    /** FileStore content revision the published index reflects (edits after it are not in it). */
+    private long indexRevision;
+    /**
+     * Recently built indexes of other scopes, so going back to a module (e.g. app after a peek into
+     * core) restores its index and merges only what changed, instead of a full rebuild.
+     */
+    private final LinkedHashMap<String, Remembered> remembered = new LinkedHashMap<>(4, 0.75f, true);
+    private static final int MAX_REMEMBERED = 3;
+
+    private record Remembered(String scope, WorkspaceTypeIndex index, Set<Path> roots, long revision) {}
 
     CompletionIndexScheduler(JavaLanguageServer server) {
         this.server = server;
@@ -59,21 +71,83 @@ final class CompletionIndexScheduler {
     /**
      * Build the index for {@code file}'s scope unless it is already covered or being built. A build
      * for a different scope is superseded, because its result would answer for the wrong module.
+     *
+     * <p>An index whose scope already sees every source of the new scope is kept as is (the app
+     * index covers core): queries are restricted per module by {@code ModuleCompiler.typeIndex}.
+     * Otherwise a remembered index of the new scope, or one covering it, is restored and only the
+     * files edited since it was built are merged.
      */
     void ensureIndexed(Path file) {
         var wanted = scopeKey(file);
+        var wantedRoots = scopeRoots(file);
         synchronized (server) {
-            if (state == State.READY && wanted.equals(scope)) return;
-            if (state == State.BUILDING) {
+            if (state != State.EMPTY) {
                 if (wanted.equals(scope)) return;
-                cancelPending();
+                if (covers(scopeRoots, wantedRoots)) {
+                    LOG.info("[index] covered scope=" + wanted + " by=" + scope);
+                    return;
+                }
+            }
+            if (state == State.READY) {
+                remember(new Remembered(scope, server.completionSnapshotRef.get().workspaceIndex(),
+                        scopeRoots, indexRevision));
+            }
+            cancelPending();
+            queued.clear();
+            // An in-flight build or merge belongs to the previous scope; it must not publish.
+            epoch++;
+            var hit = rememberedFor(wanted, wantedRoots);
+            if (hit != null) {
+                restore(hit);
+                return;
             }
             state = State.BUILDING;
             scope = wanted;
+            scopeRoots = wantedRoots;
             var startedEpoch = epoch;
             pending = server.completionIndexExecutor.schedule(
                     () -> build(wanted, startedEpoch), 0, TimeUnit.MILLISECONDS);
         }
+    }
+
+
+
+    private static boolean covers(Set<Path> outer, Set<Path> inner) {
+        return outer != null && inner != null && !outer.isEmpty() && outer.containsAll(inner);
+    }
+
+    private void remember(Remembered index) {
+        remembered.put(index.scope(), index);
+        while (remembered.size() > MAX_REMEMBERED) {
+            var eldest = remembered.keySet().iterator().next();
+            remembered.remove(eldest);
+        }
+    }
+
+    /** A remembered index of {@code wanted}, or of a scope that sees all of its sources. */
+    private Remembered rememberedFor(String wanted, Set<Path> wantedRoots) {
+        var exact = remembered.get(wanted);
+        if (exact != null) return exact;
+        for (var candidate : remembered.values()) {
+            if (covers(candidate.roots(), wantedRoots)) return candidate;
+        }
+        return null;
+    }
+
+    /** Make a remembered index current again and queue the files edited since it was built. */
+    private void restore(Remembered index) {
+        remembered.remove(index.scope());
+        state = State.READY;
+        scope = index.scope();
+        scopeRoots = index.roots();
+        indexRevision = index.revision();
+        server.publishCompletionSnapshot(index.index(), server.completionIndexVersion.incrementAndGet());
+        var changed = new ArrayList<Path>();
+        for (var file : FileStore.changedSince(index.revision())) {
+            if (index.roots() == null || index.roots().stream().anyMatch(file::startsWith)) changed.add(file);
+        }
+        LOG.info("[index] restored scope=" + scope + " changed_since=" + changed.size());
+        if (!changed.isEmpty()) filesChanged(changed);
     }
 
     /**
@@ -101,7 +175,9 @@ final class CompletionIndexScheduler {
             cancelPending();
             state = State.EMPTY;
             scope = "";
+            scopeRoots = Set.of();
             queued.clear();
+            remembered.clear();
             epoch++;
         }
         server.publishCompletionSnapshot(WorkspaceTypeIndex.EMPTY, 0);
@@ -136,6 +212,18 @@ final class CompletionIndexScheduler {
                 .orElse("");
     }
 
+    /** Source roots of {@code file}'s scope, or null when it belongs to no module. */
+    private Set<Path> scopeRoots(Path file) {
+        var moduleFile = file != null ? file : server.activeModuleFile;
+        if (moduleFile == null) moduleFile = server.workspaceRoot;
+        if (moduleFile == null) return null;
+        var target = moduleFile;
+        return server.moduleGraph.moduleForFile(target)
+                .map(module -> Set.copyOf(server.moduleGraph.transitiveSourceDirs(
+                        module.projectPath(), module.isTestSource(target))))
+                .orElse(null);
+    }
+
     /** Sources the active module's compiler can resolve: its own plus its dependency modules'. */
     private List<Path> scopeSources(Path file) {
         var all = FileStore.all();
@@ -153,10 +241,12 @@ final class CompletionIndexScheduler {
     private void build(String wanted, long startedEpoch) {
         List<Path> files;
         Path moduleFile;
+        long buildRevision;
         synchronized (server) {
             if (state != State.BUILDING || !wanted.equals(scope) || epoch != startedEpoch) return;
             moduleFile = server.activeModuleFile;
             files = scopeSources(moduleFile);
+            buildRevision = FileStore.contentRevision();
         }
         var started = Instant.now();
         var token = server.progress.begin("Index", "Indexing " + files.size() + " files");
@@ -183,6 +273,7 @@ final class CompletionIndexScheduler {
                     return;
                 }
                 server.publishCompletionSnapshot(index, server.completionIndexVersion.incrementAndGet());
+                indexRevision = buildRevision;
                 state = State.READY;
                 drained = List.copyOf(queued);
                 queued.clear();
@@ -207,12 +298,14 @@ final class CompletionIndexScheduler {
         List<Path> batch;
         Path moduleFile;
         long startedEpoch;
+        long mergeRevision;
         synchronized (server) {
             if (state != State.READY) return;
             batch = List.copyOf(queued);
             queued.clear();
             moduleFile = server.activeModuleFile;
             startedEpoch = epoch;
+            mergeRevision = FileStore.contentRevision();
         }
         if (batch.isEmpty()) return;
         var started = Instant.now();
@@ -246,6 +339,7 @@ final class CompletionIndexScheduler {
             synchronized (server) {
                 if (state != State.READY || epoch != startedEpoch) return;
                 server.publishCompletionSnapshot(merged, server.completionIndexVersion.incrementAndGet());
+                indexRevision = mergeRevision;
             }
             LOG.fine(String.format("[index] merged files=%d types=%d took=%dms",
                     indexed.size(), merged.size(), Duration.between(started, Instant.now()).toMillis()));

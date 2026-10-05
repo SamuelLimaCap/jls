@@ -9,6 +9,12 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   pré-processados uma vez por arquivo): `isLombokAnnotation` convertia cada import do arquivo em texto
   (`Tree.toString()` → `Pretty.print`) para cada anotação de cada campo — 44% do build do índice.
   Índice do `app` (7.863 arquivos): 22,0 s → 12,9 s, conteúdo idêntico (despejo de 211 mil linhas comparado).
+- **Índice não é refeito ao trocar de módulo**: se o índice atual já vê todas as pastas de fonte do
+  módulo do arquivo aberto (o do `app` contém o `core`), ele é mantido — a consulta já é recortada
+  por módulo (`ModuleCompiler.typeIndex`). Os últimos 3 índices ficam guardados: voltar a um módulo
+  restaura o índice dele e aplica só os arquivos editados desde então (`FileStore.changedSince`).
+  `app` → `core` → `app`: autocomplete pronto em 2,9 s e 0,4 s (antes: duas reconstruções de 8–15 s).
+  Recorte do índice do `app` × índice do `core` construído do zero: despejos idênticos.
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.
