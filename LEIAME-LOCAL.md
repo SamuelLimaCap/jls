@@ -21,6 +21,9 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   de `Map<K, V>` (`get`, `values`, `forEach`). Antes caíam em `Object`.
   Limite conhecido: membros de classes aninhadas de biblioteca (`Map.Entry`) não aparecem — o índice
   externo só conhece classes de primeiro nível.
+- **Comando `java.expressionType`** (`ExpressionTypeAt`): `[uri, linha, coluna]` → tipo atribuído pelo
+  javac da maior expressão que termina ali (`{type: "List<String>", qualified, imports}`). Usado pelo
+  postfix `.var` do lvim-java (`lua/lvimjava/postfix.lua`).
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.

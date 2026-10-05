@@ -370,6 +370,7 @@ class JavaLanguageServer extends LanguageServer {
         var commands = new JsonArray();
         commands.add("java.pickAndGenerate");
         commands.add("java.generateFields");
+        commands.add("java.expressionType");
         executeCommandOptions.add("commands", commands);
         c.add("executeCommandProvider", executeCommandOptions);
         return new InitializeResult(c);
@@ -1007,6 +1008,19 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public Object executeCommand(ExecuteCommandParams params) {
+        if ("java.expressionType".equals(params.command)) {
+            // [uri, line, character]: type of the expression ending there (the editor's ".var" postfix)
+            var args = params.arguments;
+            if (args == null || args.size() < 3) return null;
+            var file = Paths.get(java.net.URI.create(args.get(0).getAsString()));
+            var sources = List.<JavaFileObject>of(new SourceFileObject(file));
+            try (var task = compilerFor(file).compile(sources)) {
+                return ExpressionTypeAt.find(task, task.root(file), args.get(1).getAsInt(), args.get(2).getAsInt());
+            } catch (RuntimeException failure) {
+                LOG.warning("[expressionType] failed file=" + file.getFileName() + " cause=" + failure);
+                return null;
+            }
+        }
         if ("java.pickAndGenerate".equals(params.command)) {
             var args = params.arguments;
             if (args == null || args.size() < 3) return null;
