@@ -1161,8 +1161,26 @@ public class WorkspaceTypeIndex {
         return false;
     }
 
+    /**
+     * Accessor name (getter or setter) -> backing field, computed once per class declaration.
+     *
+     * <p>Resolving each generated accessor by scanning every field (and re-evaluating the Lombok
+     * annotations of each one) is O(fields^2) per class, which takes minutes on entity classes
+     * with hundreds of fields. Keys are tree nodes (identity semantics), held weakly so the map
+     * never outlives a parse.
+     */
+    private static final Map<ClassTree, Map<String, String>> ACCESSOR_FIELDS_BY_CLASS =
+            Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
     private static String generatedAccessorFieldName(
             String methodName, ClassTree declaration, CompilationUnitTree root) {
+        return ACCESSOR_FIELDS_BY_CLASS
+                .computeIfAbsent(declaration, ignored -> accessorFieldsOf(declaration, root))
+                .get(methodName);
+    }
+
+    private static Map<String, String> accessorFieldsOf(ClassTree declaration, CompilationUnitTree root) {
+        var byAccessor = new java.util.HashMap<String, String>();
         for (var member : declaration.getMembers()) {
             if (!(member instanceof VariableTree field)
                     || field.getName() == null
@@ -1179,12 +1197,12 @@ public class WorkspaceTypeIndex {
                     root, declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
             if (accessorInfo.isPresent()) {
                 var info = accessorInfo.get();
-                if (methodName.equals(info.getterName()) || methodName.equals(info.setterName())) {
-                    return fieldName;
-                }
+                // first field in declaration order wins, as in the original linear scan
+                if (info.getterName() != null) byAccessor.putIfAbsent(info.getterName(), fieldName);
+                if (info.setterName() != null) byAccessor.putIfAbsent(info.setterName(), fieldName);
             }
         }
-        return null;
+        return byAccessor;
     }
 
     /**
