@@ -22,6 +22,17 @@ final class CompletionIndexScheduler {
     private static final Logger LOG = Logger.getLogger("main");
     /** Coalesce keystrokes into one merge. */
     private static final long MERGE_DEBOUNCE_MS = 100;
+    /** Index build workers (JLS_INDEX_THREADS overrides); one core is left for the LSP thread. */
+    private static final int INDEX_THREADS = indexThreads();
+
+    private static int indexThreads() {
+        try {
+            var configured = System.getenv("JLS_INDEX_THREADS");
+            if (configured != null) return Math.max(1, Integer.parseInt(configured.trim()));
+        } catch (NumberFormatException ignored) {
+        }
+        return Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() - 1));
+    }
 
     private enum State {
         EMPTY,
@@ -259,13 +270,19 @@ final class CompletionIndexScheduler {
                 }
                 return;
             }
-            // Parse lazily: a module closure holds thousands of files and materialising every
-            // syntax tree at once exhausts the heap.
-            Iterable<ParseTask> parsed = () -> files.stream().map(compiler::parse).iterator();
-            var index = WorkspaceTypeIndex.fromParseTrees(
-                    parsed,
-                    (source, name) -> server.externalIndexForIndexing(source, compiler).containsType(name),
-                    (source, declaration) -> server.canReferenceModule(declaration, source));
+            // Parse in parallel but lazily: each worker holds one syntax tree at a time, since a
+            // module closure holds thousands of files and materialising every tree exhausts the heap.
+            // The post-pass asks this once per supertype name; resolving the source's module is a
+            // linear scan over the module graph, so remember it per source for this build.
+            var externalBySource = new HashMap<Path, org.javacs.index.ExternalBinaryTypeIndex>();
+            var index = WorkspaceTypeIndex.fromSources(
+                    files,
+                    compiler::parse,
+                    (source, name) -> externalBySource
+                            .computeIfAbsent(source, s -> server.externalIndexForIndexing(s, compiler))
+                            .containsType(name),
+                    (source, declaration) -> server.canReferenceModule(declaration, source),
+                    INDEX_THREADS);
             List<Path> drained;
             synchronized (server) {
                 if (!wanted.equals(scope) || epoch != startedEpoch) {

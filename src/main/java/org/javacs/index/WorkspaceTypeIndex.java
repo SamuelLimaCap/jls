@@ -627,6 +627,218 @@ public class WorkspaceTypeIndex {
             Iterable<ParseTask> parseTasks,
             BiPredicate<Path, String> knownType,
             BiPredicate<Path, Path> sourceVisible) {
+        Iterable<FileExtraction> extractions =
+                () -> new java.util.Iterator<>() {
+                    private final java.util.Iterator<ParseTask> tasks = parseTasks.iterator();
+                    @Override public boolean hasNext() { return tasks.hasNext(); }
+                    @Override public FileExtraction next() { return extract(tasks.next()); }
+                };
+        return fromExtractions(extractions, knownType, sourceVisible);
+    }
+
+    /**
+     * Same index as {@link #fromParseTrees(Iterable, BiPredicate, BiPredicate)}, with the per-file
+     * work (parse, Lombok stubs, extraction) spread over {@code threads} workers. Files are merged in
+     * list order, so every map is filled in exactly the sequential order and the result is identical.
+     */
+    public static WorkspaceTypeIndex fromSources(
+            List<Path> files,
+            java.util.function.Function<Path, ParseTask> parse,
+            BiPredicate<Path, String> knownType,
+            BiPredicate<Path, Path> sourceVisible,
+            int threads) {
+        if (threads <= 1 || files.size() < 2) {
+            return fromParseTrees(() -> files.stream().map(parse).iterator(), knownType, sourceVisible);
+        }
+        @SuppressWarnings("unchecked")
+        var results = (java.util.concurrent.CompletableFuture<FileExtraction>[])
+                new java.util.concurrent.CompletableFuture[files.size()];
+        for (int i = 0; i < results.length; i++) results[i] = new java.util.concurrent.CompletableFuture<>();
+        var next = new java.util.concurrent.atomic.AtomicInteger();
+        var workers = new ArrayList<Thread>();
+        for (int w = 0; w < threads; w++) {
+            // Workers take files in list order, so the merge below rarely waits and few finished
+            // extractions are held at once.
+            workers.add(Thread.ofPlatform().daemon().name("jls-index-" + w).start(() -> {
+                int i;
+                while ((i = next.getAndIncrement()) < results.length) {
+                    try {
+                        results[i].complete(extract(parse.apply(files.get(i))));
+                    } catch (Throwable failure) {
+                        results[i].completeExceptionally(failure);
+                    }
+                }
+            }));
+        }
+        Iterable<FileExtraction> ordered =
+                () -> new java.util.Iterator<>() {
+                    private int i;
+                    @Override public boolean hasNext() { return i < results.length; }
+                    @Override public FileExtraction next() {
+                        var future = results[i];
+                        results[i++] = null;
+                        try {
+                            return future.join();
+                        } catch (java.util.concurrent.CompletionException failure) {
+                            next.set(results.length); // stop the workers early
+                            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+                            if (failure.getCause() instanceof Error error) throw error;
+                            throw failure;
+                        }
+                    }
+                };
+        try {
+            return fromExtractions(ordered, knownType, sourceVisible);
+        } finally {
+            next.set(results.length);
+        }
+    }
+
+    /** Declarations of one source file, in the order the sequential scan used to record them. */
+    private record FileExtraction(
+            Path sourcePath,
+            URI sourceUri,
+            String packageName,
+            List<String> explicitImports,
+            List<String> staticImports,
+            List<String> declaredTypes,
+            ObjectOpenHashSet<String> tokens,
+            List<TypeExtraction> types) {}
+
+    private record TypeExtraction(
+            String qualifiedName,
+            String parent,
+            Integer kind,
+            Set<Modifier> modifiers,
+            String rawSupertype,
+            List<String> rawInterfaces,
+            Map<String, IndexedMember> members) {}
+
+    /** Parse-tree work for one file; touches no shared state, so files can be extracted in parallel. */
+    private static FileExtraction extract(ParseTask parseTask) {
+        var root = parseTask.root();
+        LombokStubInjector.injectParseTask(parseTask);
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        Path sourcePath = null;
+        URI sourceUri = null;
+        var sourceUriObj = root.getSourceFile().toUri();
+        if (sourceUriObj != null && "file".equals(sourceUriObj.getScheme())) {
+            sourcePath = Paths.get(sourceUriObj);
+            sourceUri = sourceUriObj;
+        }
+
+        var explicitImports = new ArrayList<String>();
+        var staticImports = new ArrayList<String>();
+        for (var importTree : root.getImports()) {
+            var imported = org.javacs.LombokAnnotations.treeName(importTree.getQualifiedIdentifier());
+            if (importTree.isStatic()) staticImports.add(imported);
+            else explicitImports.add(imported);
+        }
+
+        var declaredTypesInFile = new ArrayList<String>();
+        var qualifiedNameStack = new ArrayDeque<String>();
+        var fileTokens = new ObjectOpenHashSet<String>();
+        var types = new ArrayList<TypeExtraction>();
+
+        // Extract types, members, raw supertypes — all in one scan
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitIdentifier(com.sun.source.tree.IdentifierTree node, Void p) {
+                addToken(fileTokens, node.getName());
+                return super.visitIdentifier(node, p);
+            }
+
+            @Override
+            public Void visitMemberSelect(com.sun.source.tree.MemberSelectTree node, Void p) {
+                addToken(fileTokens, node.getIdentifier());
+                return super.visitMemberSelect(node, p);
+            }
+
+            @Override
+            public Void visitMemberReference(com.sun.source.tree.MemberReferenceTree node, Void p) {
+                addToken(fileTokens, node.getName());
+                return super.visitMemberReference(node, p);
+            }
+
+            @Override
+            public Void visitMethod(MethodTree node, Void p) {
+                addToken(fileTokens, node.getName());
+                return super.visitMethod(node, p);
+            }
+
+            @Override
+            public Void visitVariable(VariableTree node, Void p) {
+                addToken(fileTokens, node.getName());
+                return super.visitVariable(node, p);
+            }
+
+            @Override
+            public Void visitClass(ClassTree tree, Void p) {
+                var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
+                if (simpleName == null || simpleName.isBlank()) {
+                    return super.visitClass(tree, p);
+                }
+                var qualified = qualifiedNameStack.isEmpty()
+                        ? (packageName.isBlank() ? simpleName : packageName + "." + simpleName)
+                        : qualifiedNameStack.peek() + "." + simpleName;
+                if (!isValidIndexKey(qualified)) {
+                    return super.visitClass(tree, p);
+                }
+                var parent = qualifiedNameStack.isEmpty() ? null : qualifiedNameStack.peek();
+
+                qualifiedNameStack.push(qualified);
+                declaredTypesInFile.add(qualified);
+
+                // Store raw supertype/interface strings (resolve later)
+                String rawSupertype = null;
+                if (tree.getExtendsClause() != null) {
+                    var raw = TypeNames.normalize(tree.getExtendsClause().toString());
+                    if (raw != null && !raw.isBlank()) rawSupertype = raw;
+                }
+                var rawIfaceList = new ArrayList<String>();
+                for (var iface : tree.getImplementsClause()) {
+                    var raw = TypeNames.normalize(iface.toString());
+                    if (raw != null && !raw.isBlank()) rawIfaceList.add(raw);
+                }
+
+                // Extract members
+                var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
+                types.add(new TypeExtraction(
+                        qualified, parent, parseTreeKindToCompletionItemKind(tree.getKind()),
+                        Set.copyOf(tree.getModifiers().getFlags()), rawSupertype, rawIfaceList, seen));
+                var enclosingIsInterface = tree.getKind() == Tree.Kind.INTERFACE
+                        || tree.getKind() == Tree.Kind.ANNOTATION_TYPE;
+                for (var member : tree.getMembers()) {
+                    if (member instanceof MethodTree method) {
+                        addParseTreeMethod(qualified, method, seen, tree, root, isGeneratedClass(tree));
+                    } else if (member instanceof VariableTree variable) {
+                        addParseTreeField(
+                                qualified,
+                                variable,
+                                seen,
+                                enclosingIsInterface,
+                                isGeneratedClass(tree));
+                    }
+                }
+                if (tree.getKind() == Tree.Kind.RECORD) {
+                    addRecordComponentAccessorsFromParseTree(qualified, tree, seen);
+                    addRecordCanonicalConstructorFromParseTree(qualified, tree, seen);
+                }
+
+                var result = super.visitClass(tree, p);
+                qualifiedNameStack.pop();
+                return result;
+            }
+        }.scan(root, null);
+
+        return new FileExtraction(sourcePath, sourceUri, packageName, explicitImports, staticImports,
+                declaredTypesInFile, fileTokens, types);
+    }
+
+    private static WorkspaceTypeIndex fromExtractions(
+            Iterable<FileExtraction> extractions,
+            BiPredicate<Path, String> knownType,
+            BiPredicate<Path, Path> sourceVisible) {
         // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
         // Supertype resolution is deferred to a post-pass using collected import/package data.
         var allQualifiedNames = new ObjectOpenHashSet<String>();
@@ -646,142 +858,35 @@ public class WorkspaceTypeIndex {
         // Inverted body-identifier prefilter: token -> files mentioning it (bounded post-pass).
         var tokenFiles = new Object2ObjectOpenHashMap<String, ObjectOpenHashSet<Path>>();
 
-        for (var parseTask : parseTasks) {
-            var root = parseTask.root();
-            LombokStubInjector.injectParseTask(parseTask);
-            var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-            Path sourcePath = null;
-            URI sourceUri = null;
-            var sourceUriObj = root.getSourceFile().toUri();
-            if (sourceUriObj != null && "file".equals(sourceUriObj.getScheme())) {
-                sourcePath = Paths.get(sourceUriObj);
-                sourceUri = sourceUriObj;
+        for (var file : extractions) {
+            // Replays what the sequential scan recorded, in the same order, into the shared maps.
+            for (var type : file.types()) {
+                var qualified = type.qualifiedName();
+                if (type.parent() != null) {
+                    nestedTypesByOwner
+                            .computeIfAbsent(type.parent(), __ -> new ObjectLinkedOpenHashSet<>())
+                            .add(qualified);
+                }
+                allQualifiedNames.add(qualified);
+                typeKinds.put(qualified, type.kind());
+                typeModifiers.put(qualified, type.modifiers());
+                if (file.sourcePath() != null) {
+                    typeSources.put(qualified, file.sourcePath());
+                    typeSourceUris.put(qualified, file.sourceUri());
+                    typeSourceFile.put(qualified, file.sourcePath());
+                }
+                if (type.rawSupertype() != null) rawSupertypes.put(qualified, type.rawSupertype());
+                if (!type.rawInterfaces().isEmpty()) rawInterfaces.put(qualified, type.rawInterfaces());
+                typeDirectMembers.put(qualified, type.members());
             }
-            final var finalSourcePath = sourcePath;
-            final var finalSourceUri = sourceUri;
 
-            var explicitImports = new ArrayList<String>();
-            var staticImports = new ArrayList<String>();
-            for (var importTree : root.getImports()) {
-                var imported = org.javacs.LombokAnnotations.treeName(importTree.getQualifiedIdentifier());
-                if (importTree.isStatic()) staticImports.add(imported);
-                else explicitImports.add(imported);
-            }
-
-            var declaredTypesInFile = new ArrayList<String>();
-            var qualifiedNameStack = new ArrayDeque<String>();
-            var fileTokens = new ObjectOpenHashSet<String>();
-
-            // Extract types, members, raw supertypes — all in one scan
-            new TreeScanner<Void, Void>() {
-                @Override
-                public Void visitIdentifier(com.sun.source.tree.IdentifierTree node, Void p) {
-                    addToken(fileTokens, node.getName());
-                    return super.visitIdentifier(node, p);
-                }
-
-                @Override
-                public Void visitMemberSelect(com.sun.source.tree.MemberSelectTree node, Void p) {
-                    addToken(fileTokens, node.getIdentifier());
-                    return super.visitMemberSelect(node, p);
-                }
-
-                @Override
-                public Void visitMemberReference(com.sun.source.tree.MemberReferenceTree node, Void p) {
-                    addToken(fileTokens, node.getName());
-                    return super.visitMemberReference(node, p);
-                }
-
-                @Override
-                public Void visitMethod(MethodTree node, Void p) {
-                    addToken(fileTokens, node.getName());
-                    return super.visitMethod(node, p);
-                }
-
-                @Override
-                public Void visitVariable(VariableTree node, Void p) {
-                    addToken(fileTokens, node.getName());
-                    return super.visitVariable(node, p);
-                }
-
-                @Override
-                public Void visitClass(ClassTree tree, Void p) {
-                    var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
-                    if (simpleName == null || simpleName.isBlank()) {
-                        return super.visitClass(tree, p);
-                    }
-                    var qualified = qualifiedNameStack.isEmpty()
-                            ? (packageName.isBlank() ? simpleName : packageName + "." + simpleName)
-                            : qualifiedNameStack.peek() + "." + simpleName;
-                    if (!isValidIndexKey(qualified)) {
-                        return super.visitClass(tree, p);
-                    }
-
-                    if (!qualifiedNameStack.isEmpty()) {
-                        var parentName = qualifiedNameStack.peek();
-                        nestedTypesByOwner
-                                .computeIfAbsent(parentName, __ -> new ObjectLinkedOpenHashSet<>())
-                                .add(qualified);
-                    }
-
-                    qualifiedNameStack.push(qualified);
-                    allQualifiedNames.add(qualified);
-                    typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
-                    typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
-                    declaredTypesInFile.add(qualified);
-                    if (finalSourcePath != null) {
-                        typeSources.put(qualified, finalSourcePath);
-                        typeSourceUris.put(qualified, finalSourceUri);
-                        typeSourceFile.put(qualified, finalSourcePath);
-                    }
-
-                    // Store raw supertype/interface strings (resolve later)
-                    if (tree.getExtendsClause() != null) {
-                        var raw = TypeNames.normalize(tree.getExtendsClause().toString());
-                        if (raw != null && !raw.isBlank()) rawSupertypes.put(qualified, raw);
-                    }
-                    var rawIfaceList = new ArrayList<String>();
-                    for (var iface : tree.getImplementsClause()) {
-                        var raw = TypeNames.normalize(iface.toString());
-                        if (raw != null && !raw.isBlank()) rawIfaceList.add(raw);
-                    }
-                    if (!rawIfaceList.isEmpty()) rawInterfaces.put(qualified, rawIfaceList);
-
-                    // Extract members
-                    var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
-                    typeDirectMembers.put(qualified, seen);
-                    var enclosingIsInterface = tree.getKind() == Tree.Kind.INTERFACE
-                            || tree.getKind() == Tree.Kind.ANNOTATION_TYPE;
-                    for (var member : tree.getMembers()) {
-                        if (member instanceof MethodTree method) {
-                            addParseTreeMethod(qualified, method, seen, tree, root, isGeneratedClass(tree));
-                        } else if (member instanceof VariableTree variable) {
-                            addParseTreeField(
-                                    qualified,
-                                    variable,
-                                    seen,
-                                    enclosingIsInterface,
-                                    isGeneratedClass(tree));
-                        }
-                    }
-                    if (tree.getKind() == Tree.Kind.RECORD) {
-                        addRecordComponentAccessorsFromParseTree(qualified, tree, seen);
-                        addRecordCanonicalConstructorFromParseTree(qualified, tree, seen);
-                    }
-
-                    var result = super.visitClass(tree, p);
-                    qualifiedNameStack.pop();
-                    return result;
-                }
-            }.scan(root, null);
-
-            if (finalSourcePath != null) {
-                sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
-                        finalSourcePath, finalSourceUri, packageName,
-                        explicitImports, staticImports, declaredTypesInFile,
-                        Integer.toString(fileTokens.hashCode())));
-                for (var token : fileTokens) {
-                    tokenFiles.computeIfAbsent(token, __ -> new ObjectOpenHashSet<>()).add(finalSourcePath);
+            if (file.sourcePath() != null) {
+                sourceFileSnapshots.put(file.sourcePath(), new SourceFileSnapshot(
+                        file.sourcePath(), file.sourceUri(), file.packageName(),
+                        file.explicitImports(), file.staticImports(), file.declaredTypes(),
+                        Integer.toString(file.tokens().hashCode())));
+                for (var token : file.tokens()) {
+                    tokenFiles.computeIfAbsent(token, __ -> new ObjectOpenHashSet<>()).add(file.sourcePath());
                 }
             }
         }
@@ -1174,9 +1279,16 @@ public class WorkspaceTypeIndex {
 
     private static String generatedAccessorFieldName(
             String methodName, ClassTree declaration, CompilationUnitTree root) {
-        return ACCESSOR_FIELDS_BY_CLASS
-                .computeIfAbsent(declaration, ignored -> accessorFieldsOf(declaration, root))
-                .get(methodName);
+        // Computed outside the lock: the parallel index workers share this map, and computeIfAbsent
+        // on a synchronized map would serialize them. accessorFieldsOf is pure, so a race only
+        // computes the same value twice.
+        var fields = ACCESSOR_FIELDS_BY_CLASS.get(declaration);
+        if (fields == null) {
+            fields = accessorFieldsOf(declaration, root);
+            var raced = ACCESSOR_FIELDS_BY_CLASS.putIfAbsent(declaration, fields);
+            if (raced != null) fields = raced;
+        }
+        return fields.get(methodName);
     }
 
     private static Map<String, String> accessorFieldsOf(ClassTree declaration, CompilationUnitTree root) {

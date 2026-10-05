@@ -13,13 +13,33 @@ import org.javacs.lsp.*;
 
 class Parser {
     private static final JavaCompiler COMPILER = ServiceLoader.load(JavaCompiler.class).iterator().next();
-    private static final SourceFileManager FILE_MANAGER = new SourceFileManager();
+    /**
+     * One file manager per thread: javac file managers are not thread-safe, and the workspace index
+     * parses on several threads at once (WorkspaceTypeIndex.fromSources).
+     */
+    private static final ThreadLocal<SourceFileManager> FILE_MANAGER = ThreadLocal.withInitial(Parser::parseOnlyFileManager);
+
+    /**
+     * Parsing needs no classpath. Left unset, javac falls back to java.class.path (the server's own
+     * jars) and every new task re-reads their manifests and builds a plugin class loader over them,
+     * which cost about a quarter of the workspace index build.
+     */
+    private static SourceFileManager parseOnlyFileManager() {
+        var files = new SourceFileManager();
+        try {
+            files.setLocation(javax.tools.StandardLocation.CLASS_PATH, List.of());
+            files.setLocation(javax.tools.StandardLocation.ANNOTATION_PROCESSOR_PATH, List.of());
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return files;
+    }
 
     /** Create a task that compiles a single file */
     private static JavacTask singleFileTask(
             JavaFileObject file, DiagnosticCollector<JavaFileObject> diagnostics) {
         return (JavacTask)
-                COMPILER.getTask(null, FILE_MANAGER, diagnostics, List.of("-proc:none"), List.of(), List.of(file));
+                COMPILER.getTask(null, FILE_MANAGER.get(), diagnostics, List.of("-proc:none"), List.of(), List.of(file));
     }
 
     final JavaFileObject file;

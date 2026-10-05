@@ -24,6 +24,15 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
 - **Comando `java.expressionType`** (`ExpressionTypeAt`): `[uri, linha, coluna]` → tipo atribuído pelo
   javac da maior expressão que termina ali (`{type: "List<String>", qualified, imports}`). Usado pelo
   postfix `.var` do lvim-java (`lua/lvimjava/postfix.lua`).
+- **[branch `indice-paralelo`] Índice em paralelo**: parse + stubs do Lombok + extração por arquivo
+  rodam em N threads (`JLS_INDEX_THREADS`, padrão = núcleos − 1, máx. 8); a gravação nos mapas é feita
+  na ordem original, então o índice é idêntico (despejo de 211 mil linhas comparado). Junto:
+  - `Parser` com um file manager por thread e classpath vazio (só faz parse; o classpath padrão eram
+    os jars do próprio jls, relidos a cada arquivo — ~25% do tempo);
+  - cache de `generatedAccessorFieldName` calculado fora do lock;
+  - `externalIndexForIndexing` memorizado por arquivo no pós-processamento.
+  Índice do `app`: 12,4–13,2 s → 6,3–6,9 s (autocomplete pronto em ~4 s em vez de ~13 s). Custo: nos
+  primeiros segundos o índice disputa CPU com a primeira compilação (1º `gd` 7,0 s vs 4,0–5,1 s, 1 medição).
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.
