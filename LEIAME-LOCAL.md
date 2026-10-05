@@ -5,6 +5,10 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
 ## Correções
 - **Índice Lombok O(F²) → O(F)** (`WorkspaceTypeIndex.generatedAccessorFieldName`): a indexação de um projeto multimódulo grande caiu de 647 s para 23 s.
 
+- **Índice: nomes de anotação/import sem pretty-print** (`LombokAnnotations.treeName` + imports
+  pré-processados uma vez por arquivo): `isLombokAnnotation` convertia cada import do arquivo em texto
+  (`Tree.toString()` → `Pretty.print`) para cada anotação de cada campo — 44% do build do índice.
+  Índice do `app` (7.863 arquivos): 22,0 s → 12,9 s, conteúdo idêntico (despejo de 211 mil linhas comparado).
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.

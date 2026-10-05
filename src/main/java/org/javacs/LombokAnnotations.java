@@ -5,7 +5,10 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.LiteralTree;
+import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.MemberSelectTree;
+import com.sun.source.tree.Tree;
 import com.sun.source.tree.AssignmentTree;
 import com.sun.source.util.TreeScanner;
 import java.io.BufferedReader;
@@ -13,10 +16,14 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -304,7 +311,7 @@ public final class LombokAnnotations {
         var getterEnabled = hasAnnotation(root, classModifiers, Set.of("Data", "Value"));
         var setterEnabled = hasAnnotation(root, classModifiers, Set.of("Data"));
         for (var annotation : classModifiers.getAnnotations()) {
-            var name = simpleName(annotation.getAnnotationType().toString());
+            var name = simpleName(treeName(annotation.getAnnotationType()));
             if (!isLombokAnnotation(root, annotation)) continue;
             var none = annotation.getArguments().stream()
                     .map(Object::toString)
@@ -316,7 +323,7 @@ public final class LombokAnnotations {
             if (name.equals("Setter")) setterEnabled = !none;
         }
         for (var annotation : fieldModifiers.getAnnotations()) {
-            var name = simpleName(annotation.getAnnotationType().toString());
+            var name = simpleName(treeName(annotation.getAnnotationType()));
             if (!isLombokAnnotation(root, annotation)) continue;
             var none = annotation.getArguments().stream()
                     .map(Object::toString)
@@ -353,7 +360,7 @@ public final class LombokAnnotations {
         var chain = config.chain();
         for (var annotation : classModifiers.getAnnotations()) {
             if (!isLombokAnnotation(root, annotation)
-                    || !simpleName(annotation.getAnnotationType().toString()).equals("Accessors")) {
+                    || !simpleName(treeName(annotation.getAnnotationType())).equals("Accessors")) {
                 continue;
             }
             for (var argument : annotation.getArguments()) {
@@ -447,7 +454,7 @@ public final class LombokAnnotations {
         var toBuilder = false;
         for (var annotation : classModifiers.getAnnotations()) {
             if (!isLombokAnnotation(root, annotation)
-                    || !simpleName(annotation.getAnnotationType().toString()).equals("Builder")) {
+                    || !simpleName(treeName(annotation.getAnnotationType())).equals("Builder")) {
                 continue;
             }
             for (var argument : annotation.getArguments()) {
@@ -501,7 +508,7 @@ public final class LombokAnnotations {
             return false;
         }
         for (var annotation : modifiers.getAnnotations()) {
-            var annotationType = annotation.getAnnotationType().toString();
+            var annotationType = treeName(annotation.getAnnotationType());
             if (!isLombokAnnotation(root, annotation)) {
                 continue;
             }
@@ -515,37 +522,65 @@ public final class LombokAnnotations {
     private static boolean isStructuralLombokAnnotationType(
             CompilationUnitTree root, AnnotationTree annotation) {
         return isLombokAnnotation(root, annotation)
-                && STRUCTURAL.contains(simpleName(annotation.getAnnotationType().toString()));
+                && STRUCTURAL.contains(simpleName(treeName(annotation.getAnnotationType())));
+    }
+
+    /**
+     * The text {@code tree.toString()} gives for a name ({@code Foo}, {@code a.b.Foo}, {@code a.b.*}),
+     * without javac's pretty printer: these checks run per annotation of every field of every
+     * indexed file, and printing the trees dominated the workspace index build.
+     */
+    public static String treeName(Tree tree) {
+        if (tree instanceof IdentifierTree identifier) return identifier.getName().toString();
+        if (tree instanceof MemberSelectTree select) {
+            return treeName(select.getExpression()) + "." + select.getIdentifier();
+        }
+        return tree.toString();
+    }
+
+    /** Non-static imports of one file, by the simple name they import, plus its wildcard imports. */
+    private record Imports(Map<String, List<String>> explicitBySimpleName, Set<String> wildcards) {}
+
+    /** Weak and identity-keyed (trees do not override equals): an entry lives as long as its tree. */
+    private static final Map<CompilationUnitTree, Imports> IMPORTS =
+            Collections.synchronizedMap(new WeakHashMap<>());
+
+    private static Imports imports(CompilationUnitTree root) {
+        var cached = IMPORTS.get(root);
+        if (cached != null) return cached;
+        var explicit = new HashMap<String, List<String>>();
+        var wildcards = new HashSet<String>();
+        for (ImportTree importTree : root.getImports()) {
+            if (importTree.isStatic()) continue;
+            var imported = treeName(importTree.getQualifiedIdentifier());
+            var lastDot = imported.lastIndexOf('.');
+            if (imported.endsWith(".*")) wildcards.add(imported);
+            else if (lastDot >= 0) {
+                explicit.computeIfAbsent(imported.substring(lastDot + 1), __ -> new ArrayList<>()).add(imported);
+            }
+        }
+        var built = new Imports(explicit, wildcards);
+        IMPORTS.put(root, built);
+        return built;
     }
 
     public static boolean isLombokAnnotation(CompilationUnitTree root, AnnotationTree annotation) {
-        var name = annotation.getAnnotationType().toString();
+        var name = treeName(annotation.getAnnotationType());
         var simple = simpleName(name);
         var expectedPackage = ANNOTATION_PACKAGES.get(simple);
         if (expectedPackage == null) return false;
         var qualifiedName = expectedPackage + "." + simple;
         if (name.indexOf('.') >= 0) return name.equals(qualifiedName);
         if (root == null) return isLombokAnnotationType(name);
-        var hasExplicitImport = false;
-        for (ImportTree importTree : root.getImports()) {
-            if (importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (!imported.endsWith(".*") && imported.endsWith("." + simple)) {
-                hasExplicitImport = true;
+        var imports = imports(root);
+        var explicit = imports.explicitBySimpleName().get(simple);
+        if (explicit != null) {
+            for (var imported : explicit) {
                 if (!imported.equals(qualifiedName)) return false;
             }
+            return true;
         }
-        if (hasExplicitImport) return true;
-        var hasMatchingWildcard = false;
-        for (ImportTree importTree : root.getImports()) {
-            if (importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.equals(expectedPackage + ".*")) {
-                hasMatchingWildcard = true;
-                break;
-            }
-        }
-        if (!hasMatchingWildcard) return false;
+        if (!imports.wildcards().contains(expectedPackage + ".*")) return false;
         return !samePackageTypeMayShadow(root, simple);
     }
 

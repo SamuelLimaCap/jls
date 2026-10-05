@@ -168,7 +168,7 @@ public class LombokStubInjector {
             ModifiersTree modifiers, String annotationName, String argumentName) {
         for (var annotation : modifiers.getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)
-                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                    || !LombokAnnotations.simpleName(LombokAnnotations.treeName(annotation.getAnnotationType()))
                             .equals(annotationName)) {
                 continue;
             }
@@ -196,7 +196,7 @@ public class LombokStubInjector {
     private Long constructorFlags(ModifiersTree modifiers, String annotationName) {
         for (var annotation : modifiers.getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)
-                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                    || !LombokAnnotations.simpleName(LombokAnnotations.treeName(annotation.getAnnotationType()))
                             .equals(annotationName)) {
                 continue;
             }
@@ -319,7 +319,7 @@ public class LombokStubInjector {
             ModifiersTree modifiers, String annotationName, String argumentName) {
         for (var annotation : modifiers.getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)
-                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                    || !LombokAnnotations.simpleName(LombokAnnotations.treeName(annotation.getAnnotationType()))
                             .equals(annotationName)) {
                 continue;
             }
@@ -612,7 +612,7 @@ public class LombokStubInjector {
     private java.util.Optional<String> singularValue(JCVariableDecl field) {
         for (var annotation : field.getModifiers().getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)
-                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                    || !LombokAnnotations.simpleName(LombokAnnotations.treeName(annotation.getAnnotationType()))
                             .equals("Singular")) {
                 continue;
             }
@@ -880,7 +880,7 @@ public class LombokStubInjector {
     private String loggingType(ModifiersTree mods, LombokAnnotations.LombokConfig config) {
         for (var annotation : mods.getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)) continue;
-            var name = LombokAnnotations.simpleName(annotation.getAnnotationType().toString());
+            var name = LombokAnnotations.simpleName(LombokAnnotations.treeName(annotation.getAnnotationType()));
             switch (name) {
                 case "XSlf4j": return "org.slf4j.ext.XLogger";
                 case "Slf4j": return "org.slf4j.Logger";

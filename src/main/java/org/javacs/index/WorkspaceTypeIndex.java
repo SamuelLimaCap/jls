@@ -485,7 +485,7 @@ public class WorkspaceTypeIndex {
         var owners = new ObjectLinkedOpenHashSet<String>();
         for (var importTree : root.getImports()) {
             if (!importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
+            var imported = org.javacs.LombokAnnotations.treeName(importTree.getQualifiedIdentifier());
             staticImportOwnerType(imported, memberName).ifPresent(owners::add);
         }
         return List.copyOf(owners);
@@ -663,7 +663,7 @@ public class WorkspaceTypeIndex {
             var explicitImports = new ArrayList<String>();
             var staticImports = new ArrayList<String>();
             for (var importTree : root.getImports()) {
-                var imported = importTree.getQualifiedIdentifier().toString();
+                var imported = org.javacs.LombokAnnotations.treeName(importTree.getQualifiedIdentifier());
                 if (importTree.isStatic()) staticImports.add(imported);
                 else explicitImports.add(imported);
             }
