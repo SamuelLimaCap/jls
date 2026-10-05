@@ -8,9 +8,12 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
 ## Gerar e instalar no lvim-java
 ```bash
 cd ~/jls
-mvn -q -DskipTests package          # gera target/jls.jar (ver o pom se o nome mudar)
-cp target/jls*.jar ~/.local/share/lvim-java/jls/classpath/jls.jar
+# precisa de JDK 25: usa o runtime que já vem com o jls instalado
+JAVA_HOME=~/.local/share/lvim-java/jls/linux mvn -q -Dmaven.test.skip=true package
+cp dist/classpath/jls.jar ~/.local/share/lvim-java/jls/classpath/jls.jar
 ```
+(`-Dmaven.test.skip=true` porque os testes do upstream não compilam nesse commit.)
+
 Depois, `:JlsRestart` no lvim-java.
 
 ## Atualizar com o upstream
