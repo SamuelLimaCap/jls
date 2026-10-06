@@ -40,6 +40,14 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   (somando as flags da JVM no `java.lua` do lvim-java). Índices idênticos (despejo comparado).
 - **Correção** da corrida do índice paralelo que podia travar a construção (vaga liberada antes de
   completada → NPE no worker → espera infinita).
+- **Debug (`JavaDebugServer`)**: breakpoints aplicados a TODAS as classes do arquivo (classes internas
+  e a cópia de cada redeploy no WildFly) — antes ia só na primeira encontrada, que podia ser a interna
+  ou a do deploy antigo (breakpoint "verificado" que nunca parava); classes carregadas depois de
+  conectar também recebem os breakpoints; busca das classes filtrada pelo nome (antes consultava o
+  arquivo-fonte de todas as classes do servidor, uma ida à JVM por classe).
+  No lvim-java, o adaptador de debug usa os mesmos flags da JVM do servidor (`lua/lvimjava/jvm.lua`):
+  com flags diferentes o cache AOT compartilhado falhava e a JVM escrevia o erro na saída padrão,
+  corrompendo o protocolo — o nvim-dap fechava a sessão na hora.
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.

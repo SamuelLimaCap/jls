@@ -5,6 +5,7 @@ import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.StepRequest;
 import groovy.lang.Binding;
@@ -68,12 +69,16 @@ public class JavaDebugServer implements DebugServer {
     private VirtualMachine vm;
 
     /**
-     * Breakpoints requested before their target class has been loaded by the VM.
-     * They are resolved lazily when a matching {@link ClassPrepareEvent} is received.
+     * Breakpoints the client wants, by absolute source path. They are applied to every class that
+     * comes from that file: the top-level class, its nested/anonymous classes and, in an app server,
+     * each copy loaded by a new deployment's class loader.
      */
-    private final List<Breakpoint> pendingBreakpoints = new ArrayList<>();
+    private final java.util.Map<String, List<Breakpoint>> wantedBreakpoints = new java.util.HashMap<>();
 
-    /** Monotonically increasing counter used to assign IDs to pending breakpoints. */
+    /** Source file names that already have a {@link ClassPrepareRequest}. */
+    private final Set<String> listenedSourceNames = new HashSet<>();
+
+    /** Monotonically increasing counter used to assign IDs to breakpoints. */
     private static int breakPointCounter = 0;
 
     /**
@@ -106,9 +111,14 @@ public class JavaDebugServer implements DebugServer {
             if (event instanceof ClassPrepareEvent) {
                 var prepare = (ClassPrepareEvent) event;
                 var type = prepare.referenceType();
-                LOG.info("ClassPrepareRequest for class " + type.name() + " in source " + relativePath(type));
-                enablePendingBreakpointsIn(type);
-                vm.resume();
+                var path = relativePath(type);
+                LOG.info("ClassPrepareRequest for class " + type.name() + " in source " + path);
+                if (!path.isEmpty()) {
+                    for (var entry : wantedBreakpoints.entrySet()) {
+                        if (entry.getKey().endsWith(path)) applyBreakpoints(entry.getValue(), type);
+                    }
+                }
+                prepare.thread().resume();
             } else if (event instanceof com.sun.jdi.event.BreakpointEvent) {
                 var b = (com.sun.jdi.event.BreakpointEvent) event;
                 var evt = new StoppedEventBody();
@@ -174,185 +184,121 @@ public class JavaDebugServer implements DebugServer {
     /**
      * Sets or clears breakpoints for a single source file.
      *
-     * <p>All existing breakpoints in the requested source are disabled first, then each breakpoint
-     * in the request is enabled. If the target class is not yet loaded, the breakpoint becomes
-     * {@link #pendingBreakpoints pending} and will be resolved when the class is prepared.
+     * <p>The file's previous breakpoint requests are deleted and the new lines are applied to every
+     * loaded class from that file. A {@link ClassPrepareRequest} for the file applies them to classes
+     * loaded later (lazily loaded classes, redeployed applications), whether this runs before or
+     * after {@code configurationDone}.
      *
      * @param req DAP breakpoint request containing the source file and line numbers
-     * @return the status of each requested breakpoint (verified or pending)
+     * @return the status of each requested breakpoint (verified when some loaded class has code there)
      */
     @Override
     public SetBreakpointsResponseBody setBreakpoints(SetBreakpointsArguments req) {
         LOG.info("Received " + req.breakpoints.length + " breakpoints in " + req.source.path);
-        disableBreakpoints(req.source);
-        // Add these breakpoints to the pending set
-        var resp = new SetBreakpointsResponseBody();
-        resp.breakpoints = new Breakpoint[req.breakpoints.length];
-        for (var i = 0; i < req.breakpoints.length; i++) {
-            resp.breakpoints[i] = enableBreakpoint(req.source, req.breakpoints[i]);
+        var path = req.source.path;
+        deleteBreakpointRequests(path);
+        var wanted = new ArrayList<Breakpoint>();
+        for (var b : req.breakpoints) {
+            var bp = new Breakpoint();
+            bp.id = breakPointCounter++;
+            bp.source = new Source();
+            bp.source.path = path;
+            bp.source.name = req.source.name;
+            bp.line = b.line;
+            bp.column = b.column;
+            bp.verified = false;
+            bp.message = sourceName(path) + " is not yet loaded";
+            wanted.add(bp);
         }
+        if (wanted.isEmpty()) wantedBreakpoints.remove(path);
+        else wantedBreakpoints.put(path, wanted);
+        if (vm != null && !wanted.isEmpty()) {
+            listenForClassesOf(path);
+            for (var type : loadedTypesMatching(path)) applyBreakpoints(wanted, type);
+        }
+        var resp = new SetBreakpointsResponseBody();
+        resp.breakpoints = wanted.toArray(new Breakpoint[0]);
         return resp;
     }
 
-    /** Disables every existing JDI {@link BreakpointRequest} that belongs to the given source file. */
-    private void disableBreakpoints(Source source) {
+    /** Deletes the JDI breakpoint requests previously created for a source file. */
+    private void deleteBreakpointRequests(String path) {
+        if (vm == null) return;
+        var stale = new ArrayList<BreakpointRequest>();
         for (var b : vm.eventRequestManager().breakpointRequests()) {
-            if (matchesFile(b, source)) {
-                LOG.info(String.format("Disable breakpoint %s:%d", source.path, b.location().lineNumber()));
-                b.disable();
+            try {
+                if (path.endsWith(b.location().sourcePath(vm.getDefaultStratum()))) stale.add(b);
+            } catch (AbsentInformationException __) {
+                // no source information: cannot belong to this file
+            }
+        }
+        LOG.info("Delete " + stale.size() + " breakpoint requests in " + path);
+        vm.eventRequestManager().deleteEventRequests(stale);
+    }
+
+    /**
+     * Creates the JDI requests of these breakpoints in one class and reports the ones that became
+     * verified. A class without code at a line (e.g. a nested class) leaves that breakpoint as is.
+     */
+    private void applyBreakpoints(List<Breakpoint> breakpoints, ReferenceType type) {
+        for (var bp : breakpoints) {
+            List<Location> locations;
+            try {
+                locations = type.locationsOfLine(bp.line);
+            } catch (AbsentInformationException __) {
+                continue;
+            }
+            for (var location : locations) {
+                LOG.info(String.format("Create breakpoint %s:%d in %s", bp.source.path, bp.line, type.name()));
+                var request = vm.eventRequestManager().createBreakpointRequest(location);
+                request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                request.enable();
+            }
+            if (!locations.isEmpty() && !bp.verified) {
+                bp.verified = true;
+                bp.message = null;
+                var changed = new BreakpointEventBody();
+                changed.reason = "changed";
+                changed.breakpoint = bp;
+                client.breakpoint(changed);
             }
         }
     }
 
-    /**
-     * Attempts to activate a single source breakpoint.
-     *
-     * <p>The implementation searches three places in order:
-     * <ol>
-     *   <li>Disabled breakpoints in the same file and line — re-enable them.</li>
-     *   <li>Already-loaded classes that match the source file — set immediately via JDI.</li>
-     *   <li>If none of the above, store as a {@link #pendingBreakpoints pending breakpoint}.</li>
-     * </ol>
-     *
-     * @param source   the source file descriptor
-     * @param b        the breakpoint specification (line, optional column, condition)
-     * @return a DAP {@link Breakpoint} describing its current status
-     */
-    private Breakpoint enableBreakpoint(Source source, SourceBreakpoint b) {
-        // Check for breakpoint in disabled breakpoints
-        for (var req : vm.eventRequestManager().breakpointRequests()) {
-            if (matchesFile(req, source) && matchesLine(req, b.line)) {
-                return enableDisabledBreakpoint(source, req);
-            }
-        }
-        // Check for breakpoint in loaded classes
-        for (var type : loadedTypesMatching(source.path)) {
-            return enableBreakpointImmediately(source, b, type);
-        }
-        // If class hasn't been loaded, add breakpoint to pending list
-        return enableBreakpointLater(source, b);
+    /** Registers a {@link ClassPrepareRequest} for the classes compiled from this source file. */
+    private void listenForClassesOf(String path) {
+        var name = sourceName(path);
+        if (!listenedSourceNames.add(name)) return;
+        LOG.info("Listen for ClassPrepareRequest in " + name);
+        var request = vm.eventRequestManager().createClassPrepareRequest();
+        request.addSourceNameFilter(name);
+        // Only the loading thread waits while breakpoints are applied, not the whole server.
+        request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        request.enable();
+    }
+
+    private static String sourceName(String path) {
+        return Paths.get(path).getFileName().toString();
     }
 
     /**
-     * Returns {@code true} if the given JDI breakpoint request was set in the same source file.
-     *
-     * <p>This method can fail with {@link AbsentInformationException} when the class was compiled
-     * without debug information (e.g. {@code -g:none}). In that case we conservatively return
-     * {@code false}.
+     * Loaded classes compiled from this source file. Filters by class name first (its top-level
+     * simple name is the file name): asking the VM for the source file of every loaded class costs
+     * one round trip each, and an application server has tens of thousands of classes.
      */
-    private boolean matchesFile(BreakpointRequest b, Source source) {
-        try {
-            var relativePath = b.location().sourcePath(vm.getDefaultStratum());
-            return source.path.endsWith(relativePath);
-        } catch (AbsentInformationException __) {
-            LOG.warning("No source information for " + b.location());
-            return false;
-        }
-    }
-
-    /** Returns {@code true} if the JDI breakpoint request is located on the given line number. */
-    private boolean matchesLine(BreakpointRequest b, int line) {
-        return line == b.location().lineNumber(vm.getDefaultStratum());
-    }
-
-    /** Returns all JDI {@link ReferenceType}s whose source path matches the given absolute file path. */
     private List<ReferenceType> loadedTypesMatching(String absolutePath) {
+        var fileName = sourceName(absolutePath);
+        var topLevel = fileName.endsWith(".java") ? fileName.substring(0, fileName.length() - 5) : fileName;
         var matches = new ArrayList<ReferenceType>();
         for (var type : vm.allClasses()) {
+            var name = type.name();
+            var simple = name.substring(name.lastIndexOf('.') + 1);
+            var dollar = simple.indexOf('$');
+            if (!(dollar < 0 ? simple : simple.substring(0, dollar)).equals(topLevel)) continue;
             var path = relativePath(type);
-            if (!path.isEmpty() && absolutePath.endsWith(path)) {
-                matches.add(type);
-            }
+            if (!path.isEmpty() && absolutePath.endsWith(path)) matches.add(type);
         }
         return matches;
-    }
-
-    /**
-     * Re-enables a previously disabled breakpoint request and returns its updated DAP descriptor.
-     *
-     * @param source the source file that owns the breakpoint
-     * @param b      the disabled JDI breakpoint request
-     * @return a verified DAP {@link Breakpoint}
-     */
-    private Breakpoint enableDisabledBreakpoint(Source source, BreakpointRequest b) {
-        LOG.info(String.format("Enable disabled breakpoint %s:%d", source.path, b.location().lineNumber()));
-        b.enable();
-        var ok = new Breakpoint();
-        ok.verified = true;
-        ok.source = source;
-        ok.line = b.location().lineNumber(vm.getDefaultStratum());
-        return ok;
-    }
-
-    /**
-     * Creates a JDI breakpoint in an already-loaded class.
-     *
-     * @param source the source file
-     * @param b      the requested line breakpoint
-     * @param type   the JDI reference type that corresponds to the source file
-     * @return a verified breakpoint, or an unverified one if the line has no executable code
-     */
-    private Breakpoint enableBreakpointImmediately(Source source, SourceBreakpoint b, ReferenceType type) {
-        if (!tryEnableBreakpointImmediately(source, b, type)) {
-            var failed = new Breakpoint();
-            failed.verified = false;
-            failed.message = source.name + ":" + b.line + " could not be found or had no code on it";
-            return failed;
-        }
-        var ok = new Breakpoint();
-        ok.verified = true;
-        ok.source = source;
-        ok.line = b.line;
-        return ok;
-    }
-
-    /**
-     * Attempts to create a JDI {@link BreakpointRequest} for every executable location mapped
-     * to the given line in the reference type.
-     *
-     * @param source the source file
-     * @param b      the requested line breakpoint
-     * @param type   the JDI reference type
-     * @return {@code true} if at least one JDI breakpoint request was created
-     */
-    private boolean tryEnableBreakpointImmediately(Source source, SourceBreakpoint b, ReferenceType type) {
-        List<Location> locations;
-        try {
-            locations = type.locationsOfLine(b.line);
-        } catch (AbsentInformationException __) {
-            LOG.info(String.format("No locations in %s for breakpoint %s:%d", type.name(), source.path, b.line));
-            return false;
-        }
-        for (var l : locations) {
-            LOG.info(String.format("Create breakpoint %s:%d", source.path, l.lineNumber()));
-            var req = vm.eventRequestManager().createBreakpointRequest(l);
-            req.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-            req.enable();
-        }
-        return true;
-    }
-
-    /**
-     * Stores a breakpoint in {@link #pendingBreakpoints} because its class has not yet been loaded.
-     * A {@link ClassPrepareRequest} is already (or will be) registered so that the breakpoint is
-     * resolved automatically once the class becomes available.
-     *
-     * @param source the source file
-     * @param b      the requested line breakpoint
-     * @return a DAP {@link Breakpoint} marked as unverified with an explanatory message
-     */
-    private Breakpoint enableBreakpointLater(Source source, SourceBreakpoint b) {
-        LOG.info(String.format("Enable %s:%d later", source.path, b.line));
-        var pending = new Breakpoint();
-        pending.id = breakPointCounter++;
-        pending.source = new Source();
-        pending.source.path = source.path;
-        pending.line = b.line;
-        pending.column = b.column;
-        pending.verified = false;
-        pending.message = source.name + " is not yet loaded";
-        pendingBreakpoints.add(pending);
-        return pending;
     }
 
     @Override
@@ -367,38 +313,17 @@ public class JavaDebugServer implements DebugServer {
     }
 
     /**
-     * Finalises the configuration phase of the DAP session.
-     *
-     * <p>At this point the client has finished sending breakpoints and other setup requests.
-     * We register listeners for {@link ClassPrepareEvent}s so that pending breakpoints can be
-     * resolved lazily, attempt to resolve any breakpoints in classes that are already loaded,
-     * and finally resume the VM so execution can proceed.
+     * Finalises the configuration phase of the DAP session: breakpoints sent before the VM was
+     * attached are applied to the loaded classes and to the ones loaded later, then the VM resumes.
      */
     @Override
     public void configurationDone() {
-        listenForClassPrepareEvents();
-        enablePendingBreakpointsInLoadedClasses();
-        vm.resume();
-    }
-
-    /** Registers a {@link ClassPrepareRequest} for every distinct source file that has pending breakpoints. */
-    private void listenForClassPrepareEvents() {
         Objects.requireNonNull(vm, "vm has not been initialized");
-        // Get all file names
-        var distinctSourceNames = new HashSet<String>();
-        for (var b : pendingBreakpoints) {
-            var path = Paths.get(b.source.path);
-            var name = path.getFileName();
-            distinctSourceNames.add(name.toString());
+        for (var entry : wantedBreakpoints.entrySet()) {
+            listenForClassesOf(entry.getKey());
+            for (var type : loadedTypesMatching(entry.getKey())) applyBreakpoints(entry.getValue(), type);
         }
-        // Listen for classes with those names
-        for (var name : distinctSourceNames) {
-            LOG.info("Listen for ClassPrepareRequest in " + name);
-            var requestClassEvent = vm.eventRequestManager().createClassPrepareRequest();
-            requestClassEvent.addSourceNameFilter("*" + name);
-            requestClassEvent.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-            requestClassEvent.enable();
-        }
+        vm.resume();
     }
 
     @Override
@@ -494,78 +419,6 @@ public class JavaDebugServer implements DebugServer {
             }
         }
         return false;
-    }
-
-    /** Attempts to resolve every pending breakpoint against already-loaded classes. */
-    private void enablePendingBreakpointsInLoadedClasses() {
-        Objects.requireNonNull(vm, "vm has not been initialized");
-        for (var type : vm.allClasses()) {
-            enablePendingBreakpointsIn(type);
-        }
-    }
-
-    /**
-     * Checks whether the given reference type matches any pending breakpoint source path.
-     * If so, the breakpoints are converted to real JDI requests and removed from the pending list.
-     *
-     * @param type the JDI reference type that was just prepared or is already loaded
-     */
-    private void enablePendingBreakpointsIn(ReferenceType type) {
-        // Check that class has source information
-        var path = relativePath(type);
-        if (path.isEmpty()) return;
-        // Look for pending breakpoints that can be enabled
-        var enabled = new ArrayList<Breakpoint>();
-        for (var b : pendingBreakpoints) {
-            if (b.source.path.endsWith(path)) {
-                enablePendingBreakpoint(b, type);
-                enabled.add(b);
-            }
-        }
-        pendingBreakpoints.removeAll(enabled);
-    }
-
-    /**
-     * Creates JDI breakpoint requests for a single pending breakpoint and notifies the client
-     * of the result via a {@link BreakpointEventBody}.
-     *
-     * @param b    the pending DAP breakpoint
-     * @param type the JDI reference type that now contains the target source
-     */
-    private void enablePendingBreakpoint(Breakpoint b, ReferenceType type) {
-        try {
-            var locations = type.locationsOfLine(b.line);
-            for (var line : locations) {
-                var req = vm.eventRequestManager().createBreakpointRequest(line);
-                req.setSuspendPolicy(EventRequest.SUSPEND_ALL);
-                req.enable();
-            }
-            if (locations.isEmpty()) {
-                LOG.info("No locations at " + b.source.path + ":" + b.line);
-                var failed = new BreakpointEventBody();
-                failed.reason = "changed";
-                failed.breakpoint = b;
-                b.verified = false;
-                b.message = b.source.name + ":" + b.line + " could not be found or had no code on it";
-                client.breakpoint(failed);
-                return;
-            }
-            LOG.info("Enable breakpoint at " + b.source.path + ":" + b.line);
-            var ok = new BreakpointEventBody();
-            ok.reason = "changed";
-            ok.breakpoint = b;
-            b.verified = true;
-            b.message = null;
-            client.breakpoint(ok);
-        } catch (AbsentInformationException __) {
-            LOG.info("Absent information at " + b.source.path + ":" + b.line);
-            var failed = new BreakpointEventBody();
-            failed.reason = "changed";
-            failed.breakpoint = b;
-            b.verified = false;
-            b.message = b.source.name + ":" + b.line + " could not be found or had no code on it";
-            client.breakpoint(failed);
-        }
     }
 
     /** Returns the relative source path of a type according to the VM's default stratum, or "" if unavailable. */
