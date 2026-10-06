@@ -662,10 +662,11 @@ public class WorkspaceTypeIndex {
             workers.add(Thread.ofPlatform().daemon().name("jls-index-" + w).start(() -> {
                 int i;
                 while ((i = next.getAndIncrement()) < results.length) {
+                    var slot = results[i];
                     try {
-                        results[i].complete(extract(parse.apply(files.get(i))));
+                        slot.complete(extract(parse.apply(files.get(i))));
                     } catch (Throwable failure) {
-                        results[i].completeExceptionally(failure);
+                        slot.completeExceptionally(failure);
                     }
                 }
             }));
@@ -675,10 +676,13 @@ public class WorkspaceTypeIndex {
                     private int i;
                     @Override public boolean hasNext() { return i < results.length; }
                     @Override public FileExtraction next() {
+                        // Release the slot only after its worker completed it: a worker may still be
+                        // extracting this file while the merge already waits for it.
                         var future = results[i];
-                        results[i++] = null;
                         try {
-                            return future.join();
+                            var extraction = future.join();
+                            results[i++] = null;
+                            return extraction;
                         } catch (java.util.concurrent.CompletionException failure) {
                             next.set(results.length); // stop the workers early
                             if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
