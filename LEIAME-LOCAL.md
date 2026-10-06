@@ -24,7 +24,7 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
 - **Comando `java.expressionType`** (`ExpressionTypeAt`): `[uri, linha, coluna]` → tipo atribuído pelo
   javac da maior expressão que termina ali (`{type: "List<String>", qualified, imports}`). Usado pelo
   postfix `.var` do lvim-java (`lua/lvimjava/postfix.lua`).
-- **[branch `indice-paralelo`] Índice em paralelo**: parse + stubs do Lombok + extração por arquivo
+- **Índice em paralelo**: parse + stubs do Lombok + extração por arquivo
   rodam em N threads (`JLS_INDEX_THREADS`, padrão = núcleos − 1, máx. 8); a gravação nos mapas é feita
   na ordem original, então o índice é idêntico (despejo de 211 mil linhas comparado). Junto:
   - `Parser` com um file manager por thread e classpath vazio (só faz parse; o classpath padrão eram
@@ -33,6 +33,13 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   - `externalIndexForIndexing` memorizado por arquivo no pós-processamento.
   Índice do `app`: 12,4–13,2 s → 6,3–6,9 s (autocomplete pronto em ~4 s em vez de ~13 s). Custo: nos
   primeiros segundos o índice disputa CPU com a primeira compilação (1º `gd` 7,0 s vs 4,0–5,1 s, 1 medição).
+- **RAM do índice**: membros compartilham textos repetidos (`String.intern`, arrays vazios e conjuntos
+  de modificadores únicos — 1,8 milhão de textos, só 23% distintos) e os índices guardados para voltar
+  a um módulo ficam em `SoftReference` (a JVM descarta um parado ou quando falta memória; o módulo
+  reconstrói). Com `app`+`mod2`+`mod3`+`core`+`mod4` abertos: heap 820 → 561 MB, RSS 1,33 → ~1,05 GB
+  (somando as flags da JVM no `java.lua` do lvim-java). Índices idênticos (despejo comparado).
+- **Correção** da corrida do índice paralelo que podia travar a construção (vaga liberada antes de
+  completada → NPE no worker → espera infinita).
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.
@@ -51,7 +58,9 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
 cd ~/jls
 # precisa de JDK 25: usa o runtime que já vem com o jls instalado
 JAVA_HOME=~/.local/share/lvim-java/jls/linux mvn -q -Dmaven.test.skip=true package
-cp dist/classpath/jls.jar ~/.local/share/lvim-java/jls/classpath/jls.jar
+# copiar e RENOMEAR: um jls aberto continua lendo o jar antigo (cp por cima quebra a sessão aberta)
+cp dist/classpath/jls.jar ~/.local/share/lvim-java/jls/classpath/.jls.jar.novo
+mv ~/.local/share/lvim-java/jls/classpath/.jls.jar.novo ~/.local/share/lvim-java/jls/classpath/jls.jar
 ```
 (`-Dmaven.test.skip=true` porque os testes do upstream não compilam nesse commit.)
 
