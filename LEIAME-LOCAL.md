@@ -53,6 +53,15 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   `arr[i]`, operadores — executadas na JVM depurada (antes: Groovy sobre os espelhos do JDI, inútil para
   objetos). `toString()` automático só em tipos simples do JDK (em entidades JPA ele pode disparar lazy
   loading com a JVM parada).
+- **Debug: fonte do JDK e de bibliotecas** (`LibrarySources`): frames de classes fora dos
+  `sourceRoots` (JDK, Spring...) iam sem caminho e o nvim-dap não mostrava nada — p.ex. ao dar step
+  over num `throw new ServiceException` que o Spring captura, a parada cai no `catch` do Spring.
+  Agora: JDK → `src.zip` do JDK local com a versão da JVM depurada; biblioteca → jar do `~/.m2`
+  (e `$JBOSS_HOME/modules`) que tem a classe — com várias versões, vence a cuja tabela de linhas
+  bate com a classe carregada — usando o `-sources.jar` dele, ou o Vineflower com o mapa de linhas
+  (a seta e os breakpoints no arquivo descompilado caem na linha certa). Arquivos em
+  `~/.cache/jls-jar-sources-debug/` (o nvim-jls abre como fonte externo, somente leitura).
+  Índice dos ~1.500 jars: ~1 s em segundo plano ao conectar; 1º `stackTrace` ~0,8 s.
 - **Debug: envio sincronizado** das mensagens do adaptador: respostas e eventos saíam de duas threads e
   podiam se misturar, corrompendo o protocolo.
 - **Lançadores (`dist/launch_*.sh`)**: o passo que cria o cache AOT escrevia na saída padrão antes do

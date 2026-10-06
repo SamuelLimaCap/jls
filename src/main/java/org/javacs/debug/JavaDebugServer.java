@@ -69,6 +69,9 @@ public class JavaDebugServer implements DebugServer {
     /** Displays/expands values and evaluates expressions; created on attach. */
     private JdiInspector inspector;
 
+    /** Source of JDK and library classes (outside {@link #sourceRoots}); created on attach. */
+    private LibrarySources library;
+
     /**
      * Breakpoints the client wants, by absolute source path. They are applied to every class that
      * comes from that file: the top-level class, its nested/anonymous classes and, in an app server,
@@ -245,8 +248,10 @@ public class JavaDebugServer implements DebugServer {
     private void applyBreakpoints(List<Breakpoint> breakpoints, ReferenceType type) {
         for (var bp : breakpoints) {
             List<Location> locations;
+            // a decompiled library file has its own line numbers
+            var line = library == null ? bp.line : library.jvmLine(bp.source.path, bp.line);
             try {
-                locations = type.locationsOfLine(bp.line);
+                locations = line < 0 ? List.of() : type.locationsOfLine(line);
             } catch (AbsentInformationException __) {
                 continue;
             }
@@ -381,6 +386,7 @@ public class JavaDebugServer implements DebugServer {
             throw new RuntimeException("Failed to connect after 15 attempts");
         }
         inspector = new JdiInspector(vm);
+        library = new LibrarySources(vm.version());
         // Create a thread that reads events from the VM
         var reader = new java.lang.Thread(new ReceiveVmEvents(), "receive-vm");
         reader.setDaemon(true);
@@ -577,8 +583,17 @@ public class JavaDebugServer implements DebugServer {
         var frame = new org.javacs.debug.proto.StackFrame();
         frame.id = uniqueFrameId(f);
         frame.name = f.location().method().name();
-        frame.source = asSource(f.location());
-        frame.line = f.location().lineNumber();
+        var location = f.location();
+        frame.source = asSource(location);
+        frame.line = location.lineNumber();
+        // JDK, Spring...: source from src.zip/-sources.jar, or decompiled with the lines translated
+        if (frame.source.path == null && library != null) {
+            var found = library.resolve(location);
+            if (found.isPresent()) {
+                frame.source.path = found.get().file().toString();
+                frame.line = found.get().fileLine(location.lineNumber());
+            }
+        }
         return frame;
     }
 
