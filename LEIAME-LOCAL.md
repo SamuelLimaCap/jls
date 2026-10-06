@@ -48,6 +48,15 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   No lvim-java, o adaptador de debug usa os mesmos flags da JVM do servidor (`lua/lvimjava/jvm.lua`):
   com flags diferentes o cache AOT compartilhado falhava e a JVM escrevia o erro na saída padrão,
   corrompendo o protocolo — o nvim-dap fechava a sessão na hora.
+- **Debug: variáveis e avaliação** (`JdiInspector`): objetos, arrays, listas e mapas expansíveis no painel
+  (e o `this`); avaliação de expressões Java no frame parado — nomes, `a.b.c`, chamadas de método,
+  `arr[i]`, operadores — executadas na JVM depurada (antes: Groovy sobre os espelhos do JDI, inútil para
+  objetos). `toString()` automático só em tipos simples do JDK (em entidades JPA ele pode disparar lazy
+  loading com a JVM parada).
+- **Debug: envio sincronizado** das mensagens do adaptador: respostas e eventos saíam de duas threads e
+  podiam se misturar, corrompendo o protocolo.
+- **Lançadores (`dist/launch_*.sh`)**: o passo que cria o cache AOT escrevia na saída padrão antes do
+  protocolo começar — derrubava o servidor de linguagem ou o debug uma vez a cada jar novo.
 - **Binários do workspace** (opt-in, `JLS_WORKSPACE_BINARIES=1`): o próprio módulo e os módulos do
   workspace dos quais ele depende (ex.: `core` para o `app`) entram pelo `target/classes`, ao
   lado do fonte. O arquivo analisado é sempre compilado do fonte.

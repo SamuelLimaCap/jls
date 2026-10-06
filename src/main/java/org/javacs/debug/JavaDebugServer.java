@@ -8,8 +8,6 @@ import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.StepRequest;
-import groovy.lang.Binding;
-import groovy.lang.GroovyShell;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.nio.file.Files;
@@ -67,6 +65,9 @@ public class JavaDebugServer implements DebugServer {
 
     /** The attached JVM, available after a successful {@link #attach} call. */
     private VirtualMachine vm;
+
+    /** Displays/expands values and evaluates expressions; created on attach. */
+    private JdiInspector inspector;
 
     /**
      * Breakpoints the client wants, by absolute source path. They are applied to every class that
@@ -178,6 +179,7 @@ public class JavaDebugServer implements DebugServer {
     public Capabilities initialize(InitializeRequestArguments req) {
         var resp = new Capabilities();
         resp.supportsConfigurationDoneRequest = true;
+        resp.supportsEvaluateForHovers = true;
         return resp;
     }
 
@@ -378,6 +380,7 @@ public class JavaDebugServer implements DebugServer {
         if (!tryToConnect(req.port)) {
             throw new RuntimeException("Failed to connect after 15 attempts");
         }
+        inspector = new JdiInspector(vm);
         // Create a thread that reads events from the VM
         var reader = new java.lang.Thread(new ReceiveVmEvents(), "receive-vm");
         reader.setDaemon(true);
@@ -450,11 +453,13 @@ public class JavaDebugServer implements DebugServer {
 
     @Override
     public void continue_(ContinueArguments req) {
+        if (inspector != null) inspector.clear();
         vm.resume();
     }
 
     @Override
     public void next(NextArguments req) {
+        if (inspector != null) inspector.clear();
         var thread = findThread(req.threadId);
         if (thread == null) {
             LOG.warning("No thread with id " + req.threadId);
@@ -469,6 +474,7 @@ public class JavaDebugServer implements DebugServer {
 
     @Override
     public void stepIn(StepInArguments req) {
+        if (inspector != null) inspector.clear();
         var thread = findThread(req.threadId);
         if (thread == null) {
             LOG.warning("No thread with id " + req.threadId);
@@ -483,6 +489,7 @@ public class JavaDebugServer implements DebugServer {
 
     @Override
     public void stepOut(StepOutArguments req) {
+        if (inspector != null) inspector.clear();
         var thread = findThread(req.threadId);
         if (thread == null) {
             LOG.warning("No thread with id " + req.threadId);
@@ -724,31 +731,32 @@ public class JavaDebugServer implements DebugServer {
      */
     @Override
     public VariablesResponseBody variables(VariablesArguments req) {
+        var resp = new VariablesResponseBody();
+        if (JdiInspector.isHandle(req.variablesReference)) {
+            resp.variables = inspector.children(req.variablesReference).toArray(Variable[]::new);
+            return resp;
+        }
         var frameId = req.variablesReference / 2;
         var scopeId = (int) (req.variablesReference % 2);
         var argumentScope = scopeId == 1;
         var frame = findFrame(frameId);
+        var thread = frame.thread();
+        // Read every value first: showing one may invoke a method, which invalidates the frame.
+        var self = argumentScope ? null : frame.thisObject();
         List<LocalVariable> visible;
         try {
             visible = frame.visibleVariables();
         } catch (AbsentInformationException __) {
             LOG.warning(String.format("No visible variable information in %s", frame.location()));
-            return new VariablesResponseBody();
+            visible = List.of();
         }
         var values = frame.getValues(visible);
-        var thread = frame.thread();
         var variables = new ArrayList<Variable>();
+        if (self != null) variables.add(inspector.variable("this", self, thread, "this"));
         for (var v : visible) {
             if (v.isArgument() != argumentScope) continue;
-            var w = new Variable();
-            w.name = v.name();
-            w.value = print(values.get(v), thread);
-            w.type = v.typeName();
-            // TODO set variablesReference and allow inspecting structure of collections and POJOs
-            // TODO set variablePresentationHint
-            variables.add(w);
+            variables.add(inspector.variable(v.name(), values.get(v), thread, v.name()));
         }
-        var resp = new VariablesResponseBody();
         resp.variables = variables.toArray(Variable[]::new);
         return resp;
     }
@@ -810,39 +818,25 @@ public class JavaDebugServer implements DebugServer {
      * @param req contains the expression text and the frame ID to evaluate in
      * @return the string result of the evaluation, or an error message if the script fails
      */
+    /**
+     * Evaluates a Java expression in a stopped frame: names, field access, method calls, array
+     * indexing and simple operators, executed in the debuggee. Objects in the result can be expanded.
+     */
     @Override
     public EvaluateResponseBody evaluate(EvaluateArguments req) {
-        EvaluateResponseBody response = new EvaluateResponseBody();
+        var response = new EvaluateResponseBody();
+        if (req.frameId == null) {
+            response.result = "Pare em um breakpoint para avaliar expressões.";
+            return response;
+        }
         try {
-            com.sun.jdi.StackFrame frame = findFrame(req.frameId);
-            Binding binding = new Binding();
-            // Make the JDI StackFrame available under the name "frame"
-            binding.setProperty("frame", frame);
-            // Inject class fields into the binding
-            try {
-                for (Field field : frame.thisObject().referenceType().allFields()) {
-                    if (field.isStatic()) {
-                        binding.setVariable(field.name(), frame.thisObject().referenceType().getValue(field));
-                    } else {
-                        binding.setProperty(field.name(), frame.thisObject().getValue(field));
-                    }
-                }
-            } catch (ClassNotPreparedException e) {
-                // ignore
-            }
-            // Inject visible local variables into the binding
-            try {
-                for (LocalVariable variable : frame.visibleVariables()) {
-                    binding.setVariable(variable.name(), frame.getValue(variable));
-                }
-            } catch (AbsentInformationException e) {
-                // ignore
-            }
-            GroovyShell shell = new GroovyShell(binding);
-            Object result = shell.evaluate(req.expression);
-            response.result = result.toString();
+            var frame = new JdiInspector.FrameRef(findFrame(req.frameId));
+            var value = inspector.evaluate(req.expression, frame);
+            response.result = inspector.display(value, frame.thread);
+            response.type = value == null ? null : value.type().name();
+            response.variablesReference = inspector.reference(value, frame.thread);
         } catch (Exception e) {
-            response.result = "Evaluation error " + e.getMessage();
+            response.result = "Erro: " + JdiInspector.describe(e);
         }
         return response;
     }

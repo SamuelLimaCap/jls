@@ -81,7 +81,11 @@ public class DebugAdapter {
 
     private static final Charset UTF_8 = StandardCharsets.UTF_8;
 
-    private void send(ProtocolMessage message) {
+    /**
+     * Synchronized, one write per message: responses (request thread) and events (VM event thread,
+     * log output) are sent concurrently, and interleaved header/body bytes corrupt the stream.
+     */
+    private synchronized void send(ProtocolMessage message) {
         var jsonText = toJson(message);
         // if (!(message instanceof OutputEvent)) {
         //     LOG.info(jsonText);
@@ -89,9 +93,12 @@ public class DebugAdapter {
         var messageBytes = jsonText.getBytes(UTF_8);
         var headerText = String.format("Content-Length: %d\r\n\r\n", messageBytes.length);
         var headerBytes = headerText.getBytes(UTF_8);
+        var frame = new byte[headerBytes.length + messageBytes.length];
+        System.arraycopy(headerBytes, 0, frame, 0, headerBytes.length);
+        System.arraycopy(messageBytes, 0, frame, headerBytes.length, messageBytes.length);
         try {
-            send.write(headerBytes);
-            send.write(messageBytes);
+            send.write(frame);
+            send.flush();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
