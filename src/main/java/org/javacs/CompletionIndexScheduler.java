@@ -66,7 +66,12 @@ final class CompletionIndexScheduler {
     private final LinkedHashMap<String, Remembered> remembered = new LinkedHashMap<>(4, 0.75f, true);
     private static final int MAX_REMEMBERED = 3;
 
-    private record Remembered(String scope, WorkspaceTypeIndex index, Set<Path> roots, long revision) {}
+    /**
+     * A remembered index is only softly reachable: a big module's index is ~250 MB, so the JVM may
+     * drop one that went unused for a while (or when memory is short) and that module rebuilds.
+     */
+    private record Remembered(
+            String scope, java.lang.ref.SoftReference<WorkspaceTypeIndex> index, Set<Path> roots, long revision) {}
 
     CompletionIndexScheduler(JavaLanguageServer server) {
         this.server = server;
@@ -100,7 +105,8 @@ final class CompletionIndexScheduler {
                 }
             }
             if (state == State.READY) {
-                remember(new Remembered(scope, server.completionSnapshotRef.get().workspaceIndex(),
+                remember(new Remembered(scope,
+                        new java.lang.ref.SoftReference<>(server.completionSnapshotRef.get().workspaceIndex()),
                         scopeRoots, indexRevision));
             }
             cancelPending();
@@ -108,8 +114,7 @@ final class CompletionIndexScheduler {
             // An in-flight build or merge belongs to the previous scope; it must not publish.
             epoch++;
             var hit = rememberedFor(wanted, wantedRoots);
-            if (hit != null) {
-                restore(hit);
+            if (hit != null && restore(hit)) {
                 return;
             }
             state = State.BUILDING;
@@ -137,6 +142,11 @@ final class CompletionIndexScheduler {
 
     /** A remembered index of {@code wanted}, or of a scope that sees all of its sources. */
     private Remembered rememberedFor(String wanted, Set<Path> wantedRoots) {
+        remembered.values().removeIf(index -> {
+            var dropped = index.index().get() == null;
+            if (dropped) LOG.info("[index] remembered_dropped scope=" + index.scope());
+            return dropped;
+        });
         var exact = remembered.get(wanted);
         if (exact != null) return exact;
         for (var candidate : remembered.values()) {
@@ -145,20 +155,29 @@ final class CompletionIndexScheduler {
         return null;
     }
 
-    /** Make a remembered index current again and queue the files edited since it was built. */
-    private void restore(Remembered index) {
-        remembered.remove(index.scope());
+    /**
+     * Make a remembered index current again and queue the files edited since it was built. False
+     * when the JVM already dropped it; the caller then builds.
+     */
+    private boolean restore(Remembered remembered) {
+        var index = remembered.index().get();
+        this.remembered.remove(remembered.scope());
+        if (index == null) {
+            LOG.info("[index] remembered_dropped scope=" + remembered.scope());
+            return false;
+        }
         state = State.READY;
-        scope = index.scope();
-        scopeRoots = index.roots();
-        indexRevision = index.revision();
-        server.publishCompletionSnapshot(index.index(), server.completionIndexVersion.incrementAndGet());
+        scope = remembered.scope();
+        scopeRoots = remembered.roots();
+        indexRevision = remembered.revision();
+        server.publishCompletionSnapshot(index, server.completionIndexVersion.incrementAndGet());
         var changed = new ArrayList<Path>();
-        for (var file : FileStore.changedSince(index.revision())) {
-            if (index.roots() == null || index.roots().stream().anyMatch(file::startsWith)) changed.add(file);
+        for (var file : FileStore.changedSince(remembered.revision())) {
+            if (remembered.roots() == null || remembered.roots().stream().anyMatch(file::startsWith)) changed.add(file);
         }
         LOG.info("[index] restored scope=" + scope + " changed_since=" + changed.size());
         if (!changed.isEmpty()) filesChanged(changed);
+        return true;
     }
 
     /**
