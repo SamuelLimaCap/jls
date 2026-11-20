@@ -36,4 +36,6 @@ public interface DebugServer {
     VariablesResponseBody variables(VariablesArguments req);
 
     EvaluateResponseBody evaluate(EvaluateArguments req);
+
+    CompletionsResponseBody completions(CompletionsArguments req);
 }

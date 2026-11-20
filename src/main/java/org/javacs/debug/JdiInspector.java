@@ -6,11 +6,14 @@ import com.sun.source.util.JavacTask;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import javax.tools.JavaFileObject;
 import javax.tools.SimpleJavaFileObject;
 import javax.tools.ToolProvider;
+import org.javacs.debug.proto.CompletionItem;
 import org.javacs.debug.proto.Variable;
 
 /**
@@ -82,11 +85,85 @@ final class JdiInspector {
             if (type instanceof ClassType c && c.isEnum()) return simpleName(typeName) + "." + enumName(object, thread);
             if (isBoxedOrSimple(typeName)) return callToString(object, thread);
             var size = sizeOf(object, thread);
-            if (size >= 0) return simpleName(typeName) + " size=" + size;
+            if (size >= 0) return simpleName(typeName) + " size=" + size + preview(object);
+            return summary(object);
         } catch (Exception e) {
             // fall through to the plain description
         }
         return simpleName(typeName) + " (id=" + object.uniqueID() + ")";
+    }
+
+    private static final int SUMMARY_FIELDS = 4, SUMMARY_LENGTH = 90, SHALLOW_STRING = 30, PREVIEW_ITEMS = 3;
+
+    /**
+     * {@code Tipo{campo=valor, …}} with the first fields of the object (declared ones first, then the
+     * superclasses'). Values are read straight from the fields: nothing runs in the suspended VM, so a
+     * JPA entity shows its data without triggering lazy loading.
+     */
+    private String summary(ObjectReference object) {
+        var typeName = object.referenceType().name();
+        if (typeName.contains("$HibernateProxy$")) {
+            return simpleName(typeName.substring(0, typeName.indexOf("$HibernateProxy$"))) + " (proxy Hibernate)";
+        }
+        var text = new StringBuilder(simpleName(typeName)).append('{');
+        var count = 0;
+        for (var type = object.referenceType(); type != null; type = type instanceof ClassType c ? c.superclass() : null) {
+            if (type.name().equals("java.lang.Object")) break;
+            for (var field : type.fields()) {
+                if (field.isStatic() || field.isSynthetic() || field.name().startsWith("$$")) continue;
+                if (count == SUMMARY_FIELDS || text.length() > SUMMARY_LENGTH) return text.append(", …}").toString();
+                if (count++ > 0) text.append(", ");
+                text.append(field.name()).append('=').append(shallow(object.getValue(field)));
+            }
+        }
+        return text.append('}').toString();
+    }
+
+    /** First items of an ArrayList, read from its fields (other collections only show the size). */
+    private String preview(ObjectReference object) {
+        if (!object.referenceType().name().equals("java.util.ArrayList")) return "";
+        var sizeField = object.referenceType().fieldByName("size");
+        var dataField = object.referenceType().fieldByName("elementData");
+        if (sizeField == null || dataField == null) return "";
+        var size = ((IntegerValue) object.getValue(sizeField)).value();
+        if (size == 0 || !(object.getValue(dataField) instanceof ArrayReference data)) return "";
+        var items = new ArrayList<String>();
+        for (var item : data.getValues(0, Math.min(size, PREVIEW_ITEMS))) items.add(shallow(item));
+        return " [" + String.join(", ", items) + (size > PREVIEW_ITEMS ? ", …" : "") + "]";
+    }
+
+    /** One-word description of a field value, without invoking anything in the VM. */
+    private String shallow(Value value) {
+        if (value == null) return "null";
+        if (value instanceof StringReference s) {
+            var text = s.value();
+            return '"' + (text.length() > SHALLOW_STRING ? text.substring(0, SHALLOW_STRING) + "…" : text) + '"';
+        }
+        if (value instanceof PrimitiveValue) return value.toString();
+        if (value instanceof ArrayReference a) return simpleName(a.type().name()).replace("[]", "[" + a.length() + "]");
+        var object = (ObjectReference) value;
+        var type = object.referenceType();
+        var typeName = type.name();
+        if (type instanceof ClassType c && c.isEnum()) return enumName(object, null);
+        switch (typeName) {
+            case "java.lang.Integer", "java.lang.Long", "java.lang.Short", "java.lang.Byte", "java.lang.Double",
+                    "java.lang.Float", "java.lang.Boolean", "java.lang.Character" -> {
+                var field = type.fieldByName("value");
+                if (field != null) return String.valueOf(object.getValue(field));
+            }
+            case "java.math.BigDecimal" -> {
+                var compact = type.fieldByName("intCompact");
+                var scale = type.fieldByName("scale");
+                if (compact != null && scale != null
+                        && object.getValue(compact) instanceof LongValue l && l.value() != Long.MIN_VALUE
+                        && object.getValue(scale) instanceof IntegerValue s) {
+                    return java.math.BigDecimal.valueOf(l.value(), s.value()).toPlainString();
+                }
+            }
+            default -> {}
+        }
+        if (typeName.contains("$HibernateProxy$")) return simpleName(typeName.substring(0, typeName.indexOf("$HibernateProxy$")));
+        return simpleName(typeName);
     }
 
     private static boolean isBoxedOrSimple(String typeName) {
@@ -176,6 +253,253 @@ final class JdiInspector {
             children.add(error);
         }
         return children;
+    }
+
+    // ---------------------------------------------------------------------------------- completions
+
+    private static final int MAX_COMPLETIONS = 300;
+    private static final Set<String> HIDDEN_OBJECT_METHODS =
+            Set.of("wait", "notify", "notifyAll", "finalize", "clone", "registerNatives");
+
+    /** Type whose members are offered after a ".", with the value when it is known without running code. */
+    private record Target(ReferenceType type, Value value, boolean statics) {}
+
+    /**
+     * Completions for the expression typed so far ({@code column} is 1-based, as the client sends).
+     * After {@code a.b().} the members of the type of {@code a.b()}; otherwise the names visible in the
+     * frame. The receiver's type is resolved without running anything in the VM: locals and fields
+     * are read (their runtime type), methods give their declared return type.
+     */
+    List<CompletionItem> complete(String text, int column, FrameRef ref) {
+        var items = new ArrayList<CompletionItem>();
+        var upTo = text.substring(0, Math.max(0, Math.min(text.length(), column - 1)));
+        int start = upTo.length();
+        while (start > 0 && Character.isJavaIdentifierPart(upTo.charAt(start - 1))) start--;
+        var fragment = upTo.substring(start);
+        try {
+            if (start > 0 && upTo.charAt(start - 1) == '.') {
+                var receiver = receiver(upTo.substring(0, start - 1));
+                var target = receiver.isEmpty() ? null : resolve(receiver, ref);
+                if (target != null) members(target, fragment, start + 1, items);
+            } else {
+                names(ref, fragment, start + 1, items);
+            }
+        } catch (Exception e) {
+            // incomplete or unknown expression: no completions
+        }
+        return items;
+    }
+
+    /** The expression right before the last "." (stops at operators, spaces and unbalanced parens). */
+    private static String receiver(String text) {
+        int depth = 0, i = text.length();
+        while (i > 0) {
+            var c = text.charAt(i - 1);
+            if (c == ')' || c == ']') depth++;
+            else if (c == '(' || c == '[') {
+                if (depth == 0) break;
+                depth--;
+            } else if (depth == 0 && !(Character.isJavaIdentifierPart(c) || c == '.')) break;
+            i--;
+        }
+        return text.substring(i).trim();
+    }
+
+    /** "a.b(1, c.d()).e[0]" -> ["a", "b(1, c.d())", "e[0]"] */
+    private static List<String> segments(String chain) {
+        var parts = new ArrayList<String>();
+        int depth = 0, from = 0;
+        for (int i = 0; i < chain.length(); i++) {
+            var c = chain.charAt(i);
+            if (c == '(' || c == '[') depth++;
+            else if (c == ')' || c == ']') depth--;
+            else if (c == '.' && depth == 0) {
+                parts.add(chain.substring(from, i).trim());
+                from = i + 1;
+            }
+        }
+        parts.add(chain.substring(from).trim());
+        return parts;
+    }
+
+    /** Index right after the group opened at {@code text.charAt(0)} ("(...)" or "[...]"). */
+    private static int closing(String text) {
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            var c = text.charAt(i);
+            if (c == '(' || c == '[') depth++;
+            else if ((c == ')' || c == ']') && --depth == 0) return i + 1;
+        }
+        return text.length();
+    }
+
+    private Target resolve(String chain, FrameRef ref) throws Exception {
+        Target target = null;
+        for (var segment : segments(chain)) {
+            int n = 0;
+            while (n < segment.length() && Character.isJavaIdentifierPart(segment.charAt(n))) n++;
+            var name = segment.substring(0, n);
+            var rest = segment.substring(n).trim();
+            if (name.isEmpty()) return null;
+            var call = rest.startsWith("(");
+            if (call) rest = rest.substring(closing(rest)).trim();
+            if (target == null) {
+                if (call) {
+                    var self = ref.frame().thisObject();
+                    var type = self != null ? self.referenceType() : ref.frame().location().declaringType();
+                    target = returnType(type, name);
+                } else {
+                    target = start(name, ref);
+                }
+            } else {
+                target = call ? returnType(target.type(), name) : field(target, name);
+            }
+            while (target != null && rest.startsWith("[")) {
+                rest = rest.substring(closing(rest)).trim();
+                target = target.type() instanceof ArrayType a && componentType(a) instanceof ReferenceType c
+                        ? new Target(c, null, false)
+                        : null;
+            }
+            if (target == null) return null;
+        }
+        return target;
+    }
+
+    private static Type componentType(ArrayType array) {
+        try {
+            return array.componentType();
+        } catch (ClassNotLoadedException e) {
+            return null;
+        }
+    }
+
+    /** First name of the chain: a local, a field of this, a static field or a class. */
+    private Target start(String name, FrameRef ref) throws Exception {
+        Result result;
+        try {
+            result = identifier(name, ref);
+        } catch (NameNotFound e) {
+            return null;
+        }
+        if (result.staticType() != null) return new Target(result.staticType(), null, true);
+        if (result.value() instanceof ObjectReference o) return new Target(o.referenceType(), o, false);
+        if (result.value() != null) return null; // primitive
+        // null value: the declared type of the local or field
+        var frame = ref.frame();
+        try {
+            var local = frame.visibleVariableByName(name);
+            if (local != null) return local.type() instanceof ReferenceType t ? new Target(t, null, false) : null;
+        } catch (AbsentInformationException | ClassNotLoadedException e) {
+            // fall through to fields
+        }
+        var self = frame.thisObject();
+        var type = self != null ? self.referenceType() : frame.location().declaringType();
+        var field = type.fieldByName(name);
+        return field == null ? null : declared(field);
+    }
+
+    private Target field(Target target, String name) {
+        var field = target.type().fieldByName(name);
+        if (field == null) return null;
+        if (target.value() instanceof ObjectReference o && !field.isStatic()
+                && o.getValue(field) instanceof ObjectReference v) {
+            return new Target(v.referenceType(), v, false);
+        }
+        return declared(field);
+    }
+
+    private Target declared(Field field) {
+        ReferenceType type;
+        try {
+            type = field.type() instanceof ReferenceType t ? t : null;
+        } catch (ClassNotLoadedException e) {
+            type = findClass(field.typeName());
+        }
+        return type == null ? null : new Target(type, null, false);
+    }
+
+    /** Declared return type of the first method with that name (generics are erased: List.get gives Object). */
+    private Target returnType(ReferenceType type, String name) {
+        for (var method : type.methodsByName(name)) {
+            ReferenceType result;
+            try {
+                result = method.returnType() instanceof ReferenceType t ? t : null;
+            } catch (ClassNotLoadedException e) {
+                result = findClass(method.returnTypeName());
+            }
+            if (result != null) return new Target(result, null, false);
+        }
+        return null;
+    }
+
+    private static boolean matches(String name, String fragment) {
+        return name.regionMatches(true, 0, fragment, 0, fragment.length());
+    }
+
+    private static CompletionItem item(String label, String text, String kind, int start, String fragment) {
+        var item = new CompletionItem();
+        item.label = label;
+        item.text = text;
+        item.type = kind;
+        item.start = start;
+        item.length = fragment.length();
+        return item;
+    }
+
+    /** Library classes only offer their public API; project classes offer everything (private fields too). */
+    private static boolean library(ReferenceType type) {
+        var name = type.name();
+        for (var prefix : List.of("java.", "javax.", "jakarta.", "jdk.", "sun.", "com.sun.", "org.springframework.",
+                "org.hibernate.", "org.apache.", "com.fasterxml.")) {
+            if (name.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    private void members(Target target, String fragment, int start, List<CompletionItem> items) {
+        var type = target.type();
+        for (var field : type.allFields()) {
+            if (field.isSynthetic() || field.name().startsWith("$$") || (target.statics() && !field.isStatic())) continue;
+            if (field.name().equals("serialVersionUID") || (library(field.declaringType()) && !field.isPublic())) continue;
+            if (!matches(field.name(), fragment)) continue;
+            items.add(item(field.name() + " : " + simpleName(field.typeName()), field.name(), "field", start, fragment));
+        }
+        var seen = new HashSet<String>();
+        var fromObject = new ArrayList<CompletionItem>();
+        for (var method : type.allMethods()) {
+            if (method.isConstructor() || method.isStaticInitializer() || method.isSynthetic() || method.isBridge()) continue;
+            if (target.statics() && !method.isStatic()) continue;
+            if (library(method.declaringType()) && !method.isPublic()) continue;
+            var name = method.name();
+            if (name.contains("$") || !matches(name, fragment)) continue;
+            var objectMethod = method.declaringType().name().equals("java.lang.Object");
+            if (objectMethod && HIDDEN_OBJECT_METHODS.contains(name)) continue;
+            var args = method.argumentTypeNames();
+            if (!seen.add(name + "/" + String.join(",", args))) continue;
+            var label = name + "(" + String.join(", ", args.stream().map(JdiInspector::simpleName).toList()) + ") : "
+                    + simpleName(method.returnTypeName());
+            var completion = item(label, name + (args.isEmpty() ? "()" : "("), "method", start, fragment);
+            (objectMethod ? fromObject : items).add(completion);
+        }
+        items.addAll(fromObject);
+        if (items.size() > MAX_COMPLETIONS) items.subList(MAX_COMPLETIONS, items.size()).clear();
+    }
+
+    private void names(FrameRef ref, String fragment, int start, List<CompletionItem> items) throws Exception {
+        var frame = ref.frame();
+        try {
+            for (var local : frame.visibleVariables()) {
+                if (matches(local.name(), fragment)) {
+                    items.add(item(local.name() + " : " + simpleName(local.typeName()), local.name(), "variable", start, fragment));
+                }
+            }
+        } catch (AbsentInformationException e) {
+            // compiled without local variable information
+        }
+        var self = frame.thisObject();
+        if (self != null && matches("this", fragment)) items.add(item("this", "this", "keyword", start, fragment));
+        var type = self != null ? self.referenceType() : frame.location().declaringType();
+        members(new Target(type, self, self == null), fragment, start, items);
     }
 
     // ---------------------------------------------------------------------------------- evaluate

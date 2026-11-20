@@ -2059,7 +2059,11 @@ public class CompletionProvider {
             return null;
         }
         var effectiveCursor = cursor;
-        if (effectiveCursor < contents.length() && contents.charAt(effectiveCursor) == '.') {
+        // Between two dots ("x.|.y") the member access starts at the next dot. Right after a name
+        // ("nome|.y") the name is still being typed, so it is an ordinary identifier completion.
+        if (effectiveCursor < contents.length()
+                && contents.charAt(effectiveCursor) == '.'
+                && (effectiveCursor == 0 || !Character.isJavaIdentifierPart(contents.charAt(effectiveCursor - 1)))) {
             effectiveCursor++;
         }
         var partialStart = effectiveCursor;

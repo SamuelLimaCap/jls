@@ -183,6 +183,7 @@ public class JavaDebugServer implements DebugServer {
         var resp = new Capabilities();
         resp.supportsConfigurationDoneRequest = true;
         resp.supportsEvaluateForHovers = true;
+        resp.supportsCompletionsRequest = true;
         return resp;
     }
 
@@ -852,6 +853,21 @@ public class JavaDebugServer implements DebugServer {
             response.variablesReference = inspector.reference(value, frame.thread);
         } catch (Exception e) {
             response.result = "Erro: " + JdiInspector.describe(e);
+        }
+        return response;
+    }
+
+    /** Names and members for the expression being typed (evaluate window, REPL), see {@link JdiInspector#complete}. */
+    @Override
+    public CompletionsResponseBody completions(CompletionsArguments req) {
+        var response = new CompletionsResponseBody();
+        response.targets = new CompletionItem[0];
+        if (req.frameId == null) return response;
+        try {
+            var frame = new JdiInspector.FrameRef(findFrame(req.frameId));
+            response.targets = inspector.complete(req.text, req.column, frame).toArray(CompletionItem[]::new);
+        } catch (Exception e) {
+            LOG.fine("completions: " + JdiInspector.describe(e));
         }
         return response;
     }

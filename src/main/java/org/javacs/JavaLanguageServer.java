@@ -51,6 +51,12 @@ class JavaLanguageServer extends LanguageServer {
 
     /** Brief wait so a small project can answer its first completion from a fresh index. */
     private static final long INDEX_WAIT_MS = 200;
+    /**
+     * Opt-in (JLS_NO_INLAY_PUSH=1): skip the inlay hints pushed after each diagnostic compile. They run
+     * on the LSP thread and read class files from every classpath jar, which blocks completion for
+     * seconds on large files; useless for a client that does not show them.
+     */
+    private static final boolean NO_INLAY_PUSH = "1".equals(System.getenv("JLS_NO_INLAY_PUSH"));
 
     record CompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
@@ -848,17 +854,19 @@ class JavaLanguageServer extends LanguageServer {
                         file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
 
                 // Piggyback: compute inlay hints on the same attributed tree.
-                try {
-                    var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
-                            .inlayHints(task, file, null);
-                    if (!hints.isEmpty()) {
-                        var payload = new JsonObject();
-                        payload.addProperty("uri", file.toUri().toString());
-                        payload.add("hints", new Gson().toJsonTree(hints));
-                        client.customNotification("java/inlayHints", payload);
+                if (!NO_INLAY_PUSH) {
+                    try {
+                        var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
+                                .inlayHints(task, file, null);
+                        if (!hints.isEmpty()) {
+                            var payload = new JsonObject();
+                            payload.addProperty("uri", file.toUri().toString());
+                            payload.add("hints", new Gson().toJsonTree(hints));
+                            client.customNotification("java/inlayHints", payload);
+                        }
+                    } catch (Exception hintError) {
+                        LOG.fine("[inlayHints] piggyback failed: " + hintError.getMessage());
                     }
-                } catch (Exception hintError) {
-                    LOG.fine("[inlayHints] piggyback failed: " + hintError.getMessage());
                 }
 
                 for (var diagParams : errorReport.diagnostics()) {

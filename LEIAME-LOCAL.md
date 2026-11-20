@@ -53,6 +53,10 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   `arr[i]`, operadores — executadas na JVM depurada (antes: Groovy sobre os espelhos do JDI, inútil para
   objetos). `toString()` automático só em tipos simples do JDK (em entidades JPA ele pode disparar lazy
   loading com a JVM parada).
+- **Debug: resumo dos objetos** (`JdiInspector.summary`): `Nota{numero=9005, serie="0065", status=AUTORIZADA,
+  valor=45.90, …}` no lugar de `Nota (id=812)` — os 4 primeiros campos, lidos direto pela JVM (nenhum
+  método roda; BigDecimal remontado do `intCompact`/`scale`); proxy do Hibernate vira `Nota (proxy
+  Hibernate)`; `ArrayList` mostra os 3 primeiros itens. Teste: `JavaDebugServerTest.summarizesObjectsWithoutInvoking`.
 - **Debug: fonte do JDK e de bibliotecas** (`LibrarySources`): frames de classes fora dos
   `sourceRoots` (JDK, Spring...) iam sem caminho e o nvim-dap não mostrava nada — p.ex. ao dar step
   over num `throw new ServiceException` que o Spring captura, a parada cai no `catch` do Spring.
@@ -78,6 +82,32 @@ Branch `correcoes-locais`, criada a partir do upstream `idelice/jls` no commit `
   - Precisa existir `target/classes` dos módulos: um `mvn compile` (sem install) basta.
   - Classe apagada ou renomeada continua visível até o próximo `mvn compile`.
   - Ligado no lvim-java via `cmd_env` do nvim-jls (`~/.config/lvim-java/lua/plugins/java.lua`).
+
+- **Autocomplete com o nome colado num ponto** (`CompletionProvider.memberAccessContext`): em `nome|.metodo()` o
+  cursor pulava o ponto e o servidor listava membros de `nome`, em vez de completar o identificador. O avanço
+  agora só vale entre dois pontos (`x.|.y`). Teste: `CompletionsTest.identifierRightBeforeExistingDot`.
+- **`JLS_NO_INLAY_PUSH=1`** (`JavaLanguageServer`): não calcula os inlay hints enviados a cada compilação de
+  diagnóstico. Eles rodam na thread do LSP e abrem os jars do classpath para cada chamada de biblioteca: ~3 s
+  de bloqueio por edição num arquivo de 1.950 linhas, com autocomplete parado. Ligado no `cmd_env` do `java.lua`.
+
+- **Autocomplete depois de `session.createQuery(hql).`** (`ParseTypeResolver`, `ApiStubJars`, 16/11/2026):
+  não aparecia nada (nem `setParameter`/`uniqueResult`). Três causas em cadeia:
+  1. o class loader da reflexão pegava `javax.persistence.*` do `javaee-web-api-6.0.jar` (jar só de
+     API, sem corpo de método → `ClassFormatError`) antes do `hibernate-jpa-2.1-api`; agora os jars
+     `javaee(-web)-api-N` / `jakartaee(-web)-api-N` vão para o fim (`ApiStubJars.stubsLast`, também no
+     class loader do índice externo);
+  2. `Session.getMethods()` precisa de `javax.naming.Referenceable` (o runtime do jls não tem
+     `java.naming`): os passos de refinamento por reflexão (lambda, `Class<T>`, genérico do método)
+     agora falham sozinhos (`guardReflection`) e a resolução segue pelo tipo de retorno do índice, em
+     vez de abortar a expressão inteira;
+  3. sobrecarga: o método era escolhido só pelo nome (`rawMember`); agora `resolveOverloadedReturnType`
+     filtra por quantidade e tipo dos argumentos e, entre retornos covariantes, fica o mais específico.
+  4. (17/11) `query.set` numa linha acima de `query.setDate(...);` vira, no parse, a declaração
+     `query.set query.setDate(...)`; a variável falsa `query` (tipo `query.set`) escondia a de verdade.
+     `visitVariable` não põe no escopo a variável cujo tipo contém o cursor. `Query`/`NativeQuery`
+     `query.set` 0 → 40/41 itens (com `setParameter`).
+  Teste (java-sinc, `nfe/jar`): `getCurrentSession().createQuery(X).set` 0 → 40 itens (com `setParameter`),
+  `.setParameter(...).uni` 0 → `uniqueResult`; stream/String/Optional/lista de DAO iguais ao jar anterior.
 
 ## Gerar e instalar no lvim-java
 ```bash

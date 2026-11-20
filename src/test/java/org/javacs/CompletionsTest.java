@@ -78,6 +78,14 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void identifierRightBeforeExistingDot() {
+        // Cursor is at the end of "nomeDa" in "nomeDa.length()": the receiver is still being typed
+        var file = "/org/javacs/example/CompleteIdentifierBeforeDot.java";
+        var suggestions = filterText(file, 5, 15);
+        assertThat(suggestions, hasItems("nomeDaVariavel"));
+    }
+
+    @Test
     public void expressionInMiddleOfChain() {
         // Cursor is between the two dots in "CompleteExpression.create()..toString()"
         // This simulates deleting a method call from a chain, leaving double-dot

@@ -469,6 +469,18 @@ public class DebugAdapter {
                         send(resp);
                         break;
                     }
+                case "completions":
+                    {
+                        var resp = new CompletionsResponse();
+                        resp.type = "response";
+                        resp.command = req.command;
+                        resp.request_seq = req.seq;
+                        resp.seq = respCounter++;
+                        resp.success = true;
+                        resp.body = server.completions(gson.fromJson(json, CompletionsRequest.class).arguments);
+                        send(resp);
+                        break;
+                    }
             }
         } catch (Exception e) {
             LOG.log(Level.SEVERE, e.getMessage(), e);

@@ -157,7 +157,27 @@ public final class ParseTypeResolver {
     }
 
     // Public entrypoints.
+    // Reflection over classpath jars can fail while linking: API stub jars without method bodies
+    // (javaee-web-api 6.0 -> ClassFormatError on javax.persistence.*) or JDK modules missing from the
+    // jls runtime (javax.naming -> NoClassDefFoundError). That is an Error, which used to escape the
+    // request loop and kill the server; the expression is just unresolved.
     public Optional<TypeResolution> resolve(Tree expression, String fallbackIdentifier) {
+        try {
+            return resolveUnguarded(expression, fallbackIdentifier);
+        } catch (TypeNotPresentException | LinkageError ex) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<TypeResolution> resolveExpression(Tree expression) {
+        try {
+            return resolveExpressionAtDepth(expression, 0);
+        } catch (TypeNotPresentException | LinkageError ex) {
+            return Optional.empty();
+        }
+    }
+
+    private Optional<TypeResolution> resolveUnguarded(Tree expression, String fallbackIdentifier) {
         if (expression != null) {
             var direct = resolveExpressionAtDepth(expression, 0);
             if (direct.isPresent()) {
@@ -187,10 +207,6 @@ public final class ParseTypeResolver {
         }
         return resolveIdentifier(fallbackIdentifier)
                 .map(type -> new TypeResolution(type.qualifiedName, true, false));
-    }
-
-    public Optional<TypeResolution> resolveExpression(Tree expression) {
-        return resolveExpressionAtDepth(expression, 0);
     }
 
     public Optional<String> currentEnclosingTypeName() {
@@ -275,36 +291,204 @@ public final class ParseTypeResolver {
             if (classLiteralBound.isPresent()) {
                 return classLiteralBound;
             }
-            return resolveMethodReturnType(thisType.get(), identifier.getName().toString(), false);
+            return resolveOverloadedReturnType(
+                            thisType.get(), identifier.getName().toString(), false, invocationTree, depth)
+                    .or(() -> resolveMethodReturnType(thisType.get(), identifier.getName().toString(), false));
         }
         if (select instanceof MemberSelectTree memberSelectTree) {
             var receiver = resolveExpressionAtDepth(memberSelectTree.getExpression(), depth + 1);
             if (receiver.isEmpty()) {
                 return Optional.empty();
             }
-            var functional =
+            // The steps below use reflection, which can fail to link a library class (a JDK module
+            // missing from the jls runtime, like javax.naming for Hibernate's SessionFactory). They
+            // are refinements: on failure fall through to the plain return type.
+            var functional = guardReflection(() ->
                     functionalTargetResolver.resolveInvocationReturnType(
-                            invocationTree, memberSelectTree, receiver.get(), depth + 1);
+                            invocationTree, memberSelectTree, receiver.get(), depth + 1));
             if (functional.isPresent()) {
                 return functional;
             }
-            var classLiteralBound = resolveClassLiteralTypeVarReturn(
+            var classLiteralBound = guardReflection(() -> resolveClassLiteralTypeVarReturn(
                     receiver.get(),
                     memberSelectTree.getIdentifier().toString(),
                     receiver.get().staticContext(),
-                    invocationTree);
+                    invocationTree));
             if (classLiteralBound.isPresent()) {
                 return classLiteralBound;
             }
-            var argumentBound = resolveGenericMethodReturn(
-                    receiver.get(), memberSelectTree.getIdentifier().toString(), invocationTree, depth + 1);
+            var argumentBound = guardReflection(() -> resolveGenericMethodReturn(
+                    receiver.get(), memberSelectTree.getIdentifier().toString(), invocationTree, depth + 1));
             if (argumentBound.isPresent()) {
                 return argumentBound;
             }
-            return resolveMethodReturnType(
-                    receiver.get(),
-                    memberSelectTree.getIdentifier().toString(),
-                    receiver.get().staticContext());
+            var methodName = memberSelectTree.getIdentifier().toString();
+            return resolveOverloadedReturnType(
+                            receiver.get(), methodName, receiver.get().staticContext(), invocationTree, depth)
+                    .or(() -> resolveMethodReturnType(receiver.get(), methodName, receiver.get().staticContext()));
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Return type of an overloaded method, picking the overload by argument count and by the
+     * argument types that can be resolved. {@code rawMember} by name returns the first overload,
+     * which can be the wrong one: Hibernate's {@code Session.createQuery} has (String), (String, Class),
+     * (CriteriaQuery), (CriteriaUpdate), (CriteriaDelete) plus {@code EntityManager.createQuery(String)}
+     * with another return type, so {@code session.createQuery(hql).} completed nothing.
+     * Among covariant returns of the same signature the most specific one wins.
+     *
+     * <p>Returns empty when there is at most one overload with that arity (the normal path handles
+     * it) or when the remaining candidates return unrelated types.
+     */
+    private Optional<TypeResolution> resolveOverloadedReturnType(
+            TypeResolution receiver,
+            String methodName,
+            boolean staticContext,
+            MethodInvocationTree invocation,
+            int depth) {
+        if (receiver == null
+                || receiver.qualifiedType() == null
+                || receiver.qualifiedType().isBlank()
+                || methodName == null
+                || invocation == null
+                || depth > MAX_RESOLVE_DEPTH) {
+            return Optional.empty();
+        }
+        try {
+            var args = invocation.getArguments();
+            var candidates = new ArrayList<IndexedMember>();
+            for (var member : index.members(receiver.qualifiedType(), staticContext)) {
+                if (member.kind != CompletionItemKind.Method || !methodName.equals(member.name)) {
+                    continue;
+                }
+                var count = member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length;
+                if (count == args.size()) {
+                    candidates.add(member);
+                }
+            }
+            var external = canUseExternalInference(receiver.qualifiedType());
+            if (candidates.isEmpty() || (candidates.size() == 1 && !external)) {
+                return Optional.empty();
+            }
+            var argTypes = new ArrayList<String>();
+            for (var arg : args) {
+                var resolved = resolveExpressionAtDepth(arg, depth + 1);
+                argTypes.add(
+                        resolved.isPresent() && !resolved.get().staticContext() && !resolved.get().arrayType()
+                                ? resolved.get().qualifiedType()
+                                : null);
+            }
+            TypeResolution best = null;
+            Class<?> bestClass = null;
+            for (var member : candidates) {
+                var fits = true;
+                for (int i = 0; i < args.size() && fits; i++) {
+                    fits = argumentFits(argTypes.get(i), member.erasedParameterTypes[i]);
+                }
+                if (!fits) {
+                    continue;
+                }
+                var type = overloadReturnType(receiver, member);
+                if (type.isEmpty()) {
+                    continue;
+                }
+                if (best == null) {
+                    best = type.get();
+                    var bestName = best.qualifiedType();
+                    bestClass = guardReflection(() -> loadExternalClass(bestName)).orElse(null);
+                    continue;
+                }
+                if (Objects.equals(best.qualifiedType(), type.get().qualifiedType())) {
+                    continue;
+                }
+                var typeName = type.get().qualifiedType();
+                var typeClass = guardReflection(() -> loadExternalClass(typeName)).orElse(null);
+                if (typeClass == null || bestClass == null) {
+                    return Optional.empty();
+                }
+                if (bestClass.isAssignableFrom(typeClass)) {
+                    best = type.get();
+                    bestClass = typeClass;
+                } else if (!typeClass.isAssignableFrom(bestClass)) {
+                    return Optional.empty();
+                }
+            }
+            return Optional.ofNullable(best);
+        } catch (LinkageError | TypeNotPresentException | SecurityException e) {
+            return Optional.empty();
+        }
+    }
+
+    private static <T> Optional<T> guardReflection(java.util.function.Supplier<Optional<T>> step) {
+        try {
+            return step.get();
+        } catch (TypeNotPresentException | LinkageError | SecurityException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Argument of type {@code argumentType} (null = unknown) can be passed to {@code parameterType}? */
+    private boolean argumentFits(String argumentType, String parameterType) {
+        if (argumentType == null || parameterType == null) {
+            return true;
+        }
+        var arg = TypeNames.normalize(argumentType);
+        var param = TypeNames.normalize(parameterType);
+        if (arg.equals(param) || param.equals("java.lang.Object")) {
+            return true;
+        }
+        if (TypeNames.isPrimitive(arg) || TypeNames.isPrimitive(param)) {
+            return true; // boxing/widening: don't filter
+        }
+        try {
+            var paramClass = loadExternalClass(param);
+            var argClass = loadExternalClass(arg);
+            if (paramClass.isPresent() && argClass.isPresent()) {
+                return paramClass.get().isAssignableFrom(argClass.get());
+            }
+        } catch (TypeNotPresentException | LinkageError | SecurityException e) {
+            // can't tell: keep the overload
+        }
+        return true;
+    }
+
+    /**
+     * Return type of one indexed overload. For library methods it is read by reflection from the
+     * receiver class, taking the most specific return among same-signature methods (covariant
+     * overrides inherited from several interfaces).
+     */
+    private Optional<TypeResolution> overloadReturnType(TypeResolution receiver, IndexedMember member) {
+        if (member.provenance == IndexedMember.Provenance.WORKSPACE || isWorkspaceType(member.ownerType)) {
+            return returnTypeOf(member);
+        }
+        var reflective = guardReflection(() -> reflectiveOverloadReturnType(receiver, member));
+        return reflective.isPresent() ? reflective : returnTypeOf(member);
+    }
+
+    private Optional<TypeResolution> reflectiveOverloadReturnType(TypeResolution receiver, IndexedMember member) {
+        var owner = loadExternalClass(receiver.qualifiedType()).or(() -> loadExternalClass(member.ownerType));
+        if (owner.isPresent()) {
+            Method best = null;
+            for (var method : owner.get().getMethods()) {
+                if (!method.getName().equals(member.name)
+                        || member.isStatic != java.lang.reflect.Modifier.isStatic(method.getModifiers())
+                        || method.getParameterCount() != member.erasedParameterTypes.length) {
+                    continue;
+                }
+                var types = method.getParameterTypes();
+                var same = true;
+                for (int i = 0; i < types.length && same; i++) {
+                    same = types[i].getTypeName().equals(member.erasedParameterTypes[i]);
+                }
+                if (same && (best == null || best.getReturnType().isAssignableFrom(method.getReturnType()))) {
+                    best = method;
+                }
+            }
+            if (best != null) {
+                var bindings = bindingsForMethodOwner(receiver, best.getDeclaringClass());
+                return resolveReflectiveType(best.getGenericReturnType(), bindings);
+            }
         }
         return Optional.empty();
     }
@@ -1358,7 +1542,7 @@ public final class ParseTypeResolver {
             return externalClassLoader;
         }
         var urls =
-                compiler.classPathRoots().stream()
+                org.javacs.ApiStubJars.stubsLast(compiler.classPathRoots()).stream()
                         .map(Path::toUri)
                         .map(
                                 uri -> {
@@ -1682,6 +1866,16 @@ public final class ParseTypeResolver {
                 if (variableTree.getInitializer() != null && containsCursor(variableTree.getInitializer())) {
                     scan(variableTree.getInitializer(), p);
                     return null;
+                }
+                // Cursor inside the declared type: the variable is not in scope yet. Typing
+                // `query.set` above `query.setDate(...);` parses as the declaration
+                // `query.set query.setDate(...)`, whose name would shadow the real `query`.
+                var type = variableTree.getType();
+                if (type != null) {
+                    var typeEnd = positions.getEndPosition(root, type);
+                    if (typeEnd >= 0 && cursor <= typeEnd) {
+                        return null;
+                    }
                 }
                 addVisibleVariable(variableTree, getCurrentPath());
                 return null;

@@ -35,6 +35,11 @@ public class MarkdownHelper {
     }
 
     public static String asMarkdown(DocCommentTree comment) {
+        return asMarkdown(comment, false);
+    }
+
+    /** @param skipParams leave out @param tags (the hover lists the parameters on its own). */
+    public static String asMarkdown(DocCommentTree comment, boolean skipParams) {
         var parts = new ArrayList<String>();
         var firstSentence = renderTrees(comment.getFirstSentence());
         if (!firstSentence.isBlank()) {
@@ -44,11 +49,21 @@ public class MarkdownHelper {
         if (!body.isBlank()) {
             parts.add(body);
         }
-        var blockTags = renderBlockTags(comment.getBlockTags());
+        var tags = comment.getBlockTags();
+        if (skipParams) {
+            tags = tags.stream()
+                    .filter(tag -> !(tag instanceof ParamTree p && !p.isTypeParameter()))
+                    .toList();
+        }
+        var blockTags = renderBlockTags(tags);
         if (!blockTags.isBlank()) {
             parts.add(blockTags);
         }
         return String.join("\n\n", parts);
+    }
+
+    public static String asMarkdown(List<? extends DocTree> trees) {
+        return renderTrees(trees);
     }
 
     private static String renderTrees(List<? extends DocTree> trees) {

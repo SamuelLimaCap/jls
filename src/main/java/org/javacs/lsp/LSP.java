@@ -237,8 +237,12 @@ public class LSP {
                 if ("$/cancelRequest".equals(message.method)) {
                     var params = gson.fromJson(message.params, CancelParams.class);
                     var removed = pending.removeIf(r -> r.id != null && r.id.equals(params.id));
-                    if (removed) LOG.info(String.format("Cancelled request %d, which had not yet started", params.id));
-                    else LOG.info(String.format("Cannot cancel request %d because it has already started", params.id));
+                    // the spec wants a reply even for a cancelled request: without it the client keeps
+                    // the request open forever (nvim lists them in client.requests as "cancel")
+                    if (removed) {
+                        error(send, params.id, new ResponseError(ErrorCodes.RequestCancelled, "cancelled", null));
+                        LOG.info(String.format("Cancelled request %d, which had not yet started", params.id));
+                    } else LOG.info(String.format("Cannot cancel request %d because it has already started", params.id));
                 }
             }
 
@@ -596,7 +600,9 @@ public class LSP {
                     default:
                         LOG.warning(String.format("Don't know what to do with method `%s`", r.method));
                 }
-            } catch (Exception e) {
+            } catch (Exception | LinkageError | StackOverflowError e) {
+                // an Error in one request (e.g. a broken class in a classpath jar) used to reach Main and
+                // exit the server; answer that request with an error and keep serving
                 LOG.log(Level.SEVERE, e.getMessage(), e);
                 if (r.id != null) {
                     error(send, r.id, new ResponseError(ErrorCodes.InternalError, e.getMessage(), null));

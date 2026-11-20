@@ -1027,7 +1027,7 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
 
     private static ClassLoader buildClassLoader(Set<Path> classPath) {
         var urls =
-                classPath.stream()
+                org.javacs.ApiStubJars.stubsLast(classPath).stream()
                         .map(Path::toUri)
                         .map(
                                 uri -> {

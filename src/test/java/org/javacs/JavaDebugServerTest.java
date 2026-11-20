@@ -11,6 +11,7 @@ import org.javacs.debug.proto.*;
 import org.junit.Test;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasItem;
 
 public class JavaDebugServerTest {
     Path workingDirectory = Paths.get("src/test/examples/debug");
@@ -215,6 +216,75 @@ public class JavaDebugServerTest {
         assertThat(server.evaluate(arguments).result, containsString("Hello "));
 
         // Wait for process to exit
+        server.continue_(new ContinueArguments());
+        process.waitFor();
+    }
+
+    @Test
+    public void summarizesObjectsWithoutInvoking() throws IOException, InterruptedException {
+        launchProcess("Resumo");
+        attach(5005);
+        setBreakpoint("Resumo", 29);
+        server.configurationDone();
+        stoppedEvents.take();
+        var arguments = new EvaluateArguments();
+        for (var t : server.threads().threads) {
+            if (t.name.equals("main")) {
+                var requestTrace = new StackTraceArguments();
+                requestTrace.threadId = t.id;
+                arguments.frameId = (int) server.stackTrace(requestTrace).stackFrames[0].id;
+            }
+        }
+        arguments.expression = "nota";
+        var nota = server.evaluate(arguments).result;
+        System.out.println("nota = " + nota);
+        assertThat(nota, equalTo("Resumo$Nota{numero=9005, serie=\"0065\", status=AUTORIZADA, valor=45.90, …}"));
+
+        arguments.expression = "item";
+        assertThat(server.evaluate(arguments).result, equalTo("Resumo$Item{descricao=\"parafuso\"}"));
+
+        arguments.expression = "nota.itens";
+        var itens = server.evaluate(arguments).result;
+        System.out.println("nota.itens = " + itens);
+        assertThat(itens, equalTo("ArrayList size=4 [Resumo$Item, Resumo$Item, Resumo$Item, …]"));
+
+        arguments.expression = "nota.id";
+        assertThat(server.evaluate(arguments).result, equalTo("812"));
+
+        server.continue_(new ContinueArguments());
+        process.waitFor();
+    }
+
+    @Test
+    public void completesNamesAndMembers() throws IOException, InterruptedException {
+        launchProcess("Resumo");
+        attach(5005);
+        setBreakpoint("Resumo", 29);
+        server.configurationDone();
+        stoppedEvents.take();
+        var arguments = new CompletionsArguments();
+        for (var t : server.threads().threads) {
+            if (t.name.equals("main")) {
+                var requestTrace = new StackTraceArguments();
+                requestTrace.threadId = t.id;
+                arguments.frameId = (int) server.stackTrace(requestTrace).stackFrames[0].id;
+            }
+        }
+        java.util.function.Function<String, List<String>> labels = text -> {
+            arguments.text = text;
+            arguments.column = text.length() + 1;
+            var list = new java.util.ArrayList<String>();
+            for (var item : server.completions(arguments).targets) list.add(item.label + " -> " + item.text);
+            System.out.println(text + " => " + list);
+            return list;
+        };
+        assertThat(labels.apply("no"), hasItem("nota : Resumo$Nota -> nota"));
+        assertThat(labels.apply("nota.va"), hasItem("valor : BigDecimal -> valor"));
+        assertThat(labels.apply("nota."), hasItem("id : Long -> id"));
+        assertThat(labels.apply("nota.itens.si"), hasItem("size() : int -> size()"));
+        assertThat(labels.apply("item.descricao.toUpp"), hasItem("toUpperCase() : String -> toUpperCase()"));
+        assertThat(labels.apply("x + nota.serie.isE"), hasItem("isEmpty() : boolean -> isEmpty()"));
+
         server.continue_(new ContinueArguments());
         process.waitFor();
     }
